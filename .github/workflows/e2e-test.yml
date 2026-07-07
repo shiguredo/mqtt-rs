@@ -1,0 +1,24 @@
+name: E2E Test
+
+on:
+  push:
+    branches:
+      - develop
+      - feature/*
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  e2e:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout の v7.0.0
+
+      - name: Set up Rust toolchain
+        run: rustup update stable
+
+      - name: Run E2E tests with Mosquitto / EMQX
+        env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test -p e2e-tests -p quic-mqtt -p tokio-mqtt

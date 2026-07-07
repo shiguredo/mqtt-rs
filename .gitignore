@@ -1,0 +1,14 @@
+# Rust
+target/
+
+# Agents
+.claude/
+.codex/
+.cursor/
+.kimi-code/
+
+# macOS
+.DS_Store
+
+# proptest
+**/*.proptest-regressions

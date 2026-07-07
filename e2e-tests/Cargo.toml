@@ -1,0 +1,71 @@
+[package]
+name = "e2e-tests"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# テスト対象の本体クレート
+shiguredo_mqtt = { path = ".." }
+# 非同期ランタイム（ブローカーとの TCP 通信用）
+tokio = { version = "1.53", features = ["full"] }
+
+# 複数キーを持つ依存はインラインテーブルではなくテーブルセクションで記述する。
+# tombi は行長超過のインラインテーブルを複数行に展開するが、複数行インラインテーブルは
+# TOML 1.1 の機能であり MSRV (cargo 1.88) ではマニフェストを解析できない。
+
+# SCRAM-SHA-256 (RFC 5802 / RFC 7677) の PBKDF2 / HMAC / ダイジェスト / CSPRNG に使用
+[dependencies.aws-lc-rs]
+version = "1.17"
+
+# SCRAM メッセージ中の nonce / salt / proof / ServerSignature の Base64 (RFC 4648) に使用
+[dependencies.base64ct]
+version = "1.8"
+features = ["alloc"]
+
+# EMQX QUIC / Mosquitto mqtts に注入する自己署名 CA / server 証明書の生成に使用
+# ring 依存を持ち込まないよう default features を切り、aws_lc_rs backend を使う
+[dependencies.rcgen]
+version = "0.14"
+default-features = false
+features = ["aws_lc_rs", "pem"]
+
+# EMQX Dashboard HTTP API (平文) で SCRAM authenticator / ユーザーを登録するために使用
+# TLS は不要なため default features を切る (ring を引き込む rustls-tls は使わない)
+# ボディは手書き JSON 文字列で送受信し、serde / json feature は使わない
+[dependencies.reqwest]
+version = "0.13"
+default-features = false
+
+# MQTT over TLS (mqtts) の E2E smoke test 用 TLS 実装
+# 本体 shiguredo_mqtt は sans-I/O のため TLS は e2e-tests 側だけで扱う
+# 暗号バックエンドは aws-lc-rs に揃え、ring を持ち込まない
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws-lc-rs", "std", "tls12"]
+
+# MQTT over QUIC の E2E smoke test 用の QUIC クライアント
+# 本体 shiguredo_mqtt は sans-I/O のため QUIC transport は e2e-tests 側だけで扱う
+# provider-tls-rustls を明示指定して s2n-tls (C 実装) の依存を避けつつ、
+# 実行に必要な provider-address-token-default も併せて有効化する
+# (aws/s2n-quic の examples/rustls-provider と同じ構成)。
+[dependencies.s2n-quic]
+version = "1.83"
+default-features = false
+features = ["provider-address-token-default", "provider-tls-rustls"]
+
+# Docker コンテナで実 MQTT ブローカー (Mosquitto) を起動するため
+# default features の "ring" を切り、bollard の rustls backend も aws-lc-rs に揃える
+[dependencies.testcontainers-modules]
+version = "0.15"
+default-features = false
+features = ["aws-lc-rs", "mosquitto"]
+
+# MQTT over TLS (mqtts) の E2E smoke test 用 tokio ↔ rustls ブリッジ
+[dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["aws-lc-rs", "tls12"]

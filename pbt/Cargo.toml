@@ -1,0 +1,13 @@
+[package]
+name = "pbt"
+version = "2026.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# プロパティベーステスト (PBT) の実行用
+proptest = "1.11"
+# テスト対象の本体クレート
+shiguredo_mqtt = { path = ".." }

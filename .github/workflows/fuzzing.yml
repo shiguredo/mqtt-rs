@@ -1,0 +1,42 @@
+name: Fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 各 fuzz ターゲットの最大実行時間（秒）
+        required: false
+        default: "300"
+        type: string
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout の v7.0.0
+
+      - name: Set up nightly Rust toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Run fuzz targets
+        working-directory: fuzz
+        run: |
+          MAX_TIME="${{ inputs.max_total_time }}"
+          cargo +nightly fuzz run decode_v311 -- -max_total_time="$MAX_TIME"
+          cargo +nightly fuzz run decode_v5 -- -max_total_time="$MAX_TIME"
+          cargo +nightly fuzz run codec_v311 -- -max_total_time="$MAX_TIME"
+          cargo +nightly fuzz run codec_v5 -- -max_total_time="$MAX_TIME"
+          cargo +nightly fuzz run decode_frag_v311 -- -max_total_time="$MAX_TIME"
+          cargo +nightly fuzz run decode_frag_v5 -- -max_total_time="$MAX_TIME"
+
+      - name: Upload fuzz crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # actions/upload-artifact の v7.0.1
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts/
+          retention-days: 7

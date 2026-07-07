@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - develop
+      - feature/*
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout の v7.0.0
+
+      - name: Set up Rust toolchain
+        run: rustup update stable
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run cargo test
+        run: cargo test --workspace --all-features --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt
+
+  msrv:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout の v7.0.0
+
+      - name: Read MSRV from Cargo.toml
+        run: |
+          MSRV=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "shiguredo_mqtt") | .rust_version')
+          echo "MSRV=$MSRV" >> "$GITHUB_ENV"
+
+      - name: Set up MSRV Rust toolchain
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - name: Run cargo check on workspace with MSRV
+        run: cargo "+$MSRV" check --workspace --all-features
+
+  no_std:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout の v7.0.0
+
+      - name: Set up Rust toolchain
+        run: rustup update stable
+
+      - name: Add no_std target
+        run: rustup target add thumbv7em-none-eabi
+
+      - name: Run cargo clippy for no_std target
+        run: cargo clippy --target thumbv7em-none-eabi -- -D warnings

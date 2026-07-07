@@ -1,0 +1,2 @@
+# MQTT 仕様書 (OASIS)。原文の CRLF を保ち、GitHub 言語統計から除外する。
+refs/*.html text eol=crlf linguist-vendored

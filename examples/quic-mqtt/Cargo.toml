@@ -1,0 +1,65 @@
+[package]
+name = "quic-mqtt"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "MQTT over QUIC client example based on s2n-quic"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "quic_mqtt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quic-mqtt"
+path = "src/main.rs"
+
+[dependencies]
+# コマンドライン引数のパース
+noargs = "0.4"
+# MQTT クライアント本体（Sans-I/O）
+shiguredo_mqtt = { path = "../.." }
+# ログ出力
+tracing = "0.1"
+# ログのフォーマットとサブスクライバ
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 複数キーを持つ依存はインラインテーブルではなくテーブルセクションで記述する。
+# tombi は行長超過のインラインテーブルを複数行に展開するが、複数行インラインテーブルは
+# TOML 1.1 の機能であり MSRV (cargo 1.88) ではマニフェストを解析できない。
+
+# MQTT over QUIC 用の QUIC クライアント
+# provider-tls-rustls を明示指定して s2n-tls (C 実装) の依存を避けつつ、
+# 実行に必要な provider-address-token-default も併せて有効化する
+# (aws/s2n-quic の examples/rustls-provider と同じ構成)。
+[dependencies.s2n-quic]
+version = "1.83"
+default-features = false
+features = ["provider-address-token-default", "provider-tls-rustls"]
+
+# 非同期 I/O ランタイム（タイマー・シグナル・名前解決用）
+[dependencies.tokio]
+version = "1.52"
+features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "time",
+]
+
+# EMQX QUIC 統合テスト用の自己署名 CA / server 証明書の生成に使用
+# ring 依存を持ち込まないよう default features を切り、aws_lc_rs backend を使う
+[dev-dependencies.rcgen]
+version = "0.14"
+default-features = false
+features = ["aws_lc_rs", "pem"]
+
+# EMQX コンテナを起動して MQTT over QUIC の smoke test を行うために使用
+# default features の "ring" を切り、bollard の rustls backend も aws-lc-rs に揃える
+[dev-dependencies.testcontainers-modules]
+version = "0.15"
+default-features = false
+features = ["aws-lc-rs"]

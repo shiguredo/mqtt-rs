@@ -1,0 +1,25 @@
+[package]
+name = "shiguredo_mqtt"
+version = "2026.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A sans-I/O MQTT client library supporting MQTT v3.1.1 and v5.0"
+readme = "README.md"
+homepage = "https://github.com/shiguredo/mqtt-rs"
+repository = "https://github.com/shiguredo/mqtt-rs"
+license = "Apache-2.0"
+include = ["/LICENSE", "/README.md", "/src/**"]
+
+[workspace]
+members = ["e2e-tests", "examples/quic-mqtt", "examples/tokio-mqtt", "pbt"]
+exclude = ["fuzz"]
+
+[[bench]]
+harness = false
+name = "decoder_drain"
+
+[dependencies]
+
+[dev-dependencies]
+# ベンチマーク測定用
+criterion = { version = "0.8", features = ["html_reports"] }

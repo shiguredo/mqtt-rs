@@ -1,0 +1,48 @@
+[package]
+name = "fuzz"
+version = "2026.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[[bin]]
+name = "decode_v5"
+path = "fuzz_targets/decode_v5.rs"
+test = false
+
+[[bin]]
+name = "decode_v311"
+path = "fuzz_targets/decode_v311.rs"
+test = false
+
+[[bin]]
+name = "codec_v5"
+path = "fuzz_targets/codec_v5.rs"
+test = false
+
+[[bin]]
+name = "codec_v311"
+path = "fuzz_targets/codec_v311.rs"
+test = false
+
+[[bin]]
+name = "decode_frag_v5"
+path = "fuzz_targets/decode_frag_v5.rs"
+test = false
+
+[[bin]]
+name = "decode_frag_v311"
+path = "fuzz_targets/decode_frag_v311.rs"
+test = false
+
+[dependencies]
+# cargo-fuzz (libFuzzer) の fuzz ターゲット実装用
+libfuzzer-sys = "0.4"
+# fuzzing 対象の本体クレート
+shiguredo_mqtt = { path = ".." }
