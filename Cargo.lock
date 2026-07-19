@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "shiguredo_mqtt"
-version = "2026.0.0"
+version = "2026.1.0-canary.0"
 dependencies = [
  "criterion",
 ]

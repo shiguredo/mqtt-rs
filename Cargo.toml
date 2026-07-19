@@ -1,6 +1,6 @@
 [package]
 name = "shiguredo_mqtt"
-version = "2026.0.0"
+version = "2026.1.0-canary.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A sans-I/O MQTT client library supporting MQTT v3.1.1 and v5.0"
