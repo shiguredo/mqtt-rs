@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
 };
-use shiguredo_container::core::{AccessMode, IntoContainerPort, Mount};
-use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use shiguredo_container::core::{AccessMode, ContainerPort, IntoContainerPort, Mount};
+use shiguredo_container::{AsyncRunner, ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use tokio::time::{Instant, sleep};
 
 use quic_mqtt::client::MqttClient;
@@ -76,6 +76,33 @@ fn force_remove_container(id: &str) {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", id])
             .output();
+    }
+}
+
+/// コンテナポートをホストへ公開した `ContainerRequest` を返す。
+///
+/// - macOS: `with_exposed_port` が空きホストポートを自動割当する
+/// - Linux: `with_exposed_port` は PortBindings に載らないため、
+///   `with_mapped_port(0, …)` で Docker にランダム割当させる
+fn publish_ports(
+    image: GenericImage,
+    ports: impl IntoIterator<Item = ContainerPort>,
+) -> ContainerRequest<GenericImage> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut req: ContainerRequest<GenericImage> = image.into();
+        for port in ports {
+            req = req.with_mapped_port(0, port);
+        }
+        req
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut image = image;
+        for port in ports {
+            image = image.with_exposed_port(port);
+        }
+        image.into()
     }
 }
 
@@ -149,37 +176,36 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         generated.server_key_pem.as_bytes(),
     );
 
-    let container = GenericImage::new("emqx/emqx", "5.8.8")
-        // QUIC は UDP なので UDP ポートとして expose する必要がある。
-        .with_exposed_port(14567.udp())
-        // フル起動判定用に Dashboard も公開する (Linux ではログ待機不可)。
-        .with_exposed_port(18083.tcp())
-        // 以下は QUIC listener を有効化するための環境変数。
-        // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
-        // （etc/examples/listeners.quic.conf.example を参照）。
-        // したがって env override は SSL_OPTIONS を挟む必要がある。
-        // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
-        // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
-        .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
-        .with_env_var(
-            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
-            cert_env_path,
-        )
-        .with_env_var(
-            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
-            key_env_path,
-        )
-        .with_mount(
-            Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_mount(
-            Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .start()
-        .await
-        .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
+    let container = publish_ports(
+        GenericImage::new("emqx/emqx", "5.8.8"),
+        [14567.udp(), 18083.tcp()],
+    )
+    // 以下は QUIC listener を有効化するための環境変数。
+    // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
+    // （etc/examples/listeners.quic.conf.example を参照）。
+    // したがって env override は SSL_OPTIONS を挟む必要がある。
+    // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
+    // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
+    .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
+    .with_env_var(
+        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
+        cert_env_path,
+    )
+    .with_env_var(
+        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
+        key_env_path,
+    )
+    .with_mount(
+        Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
+            .with_access_mode(AccessMode::ReadOnly),
+    )
+    .with_mount(
+        Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
+            .with_access_mode(AccessMode::ReadOnly),
+    )
+    .start()
+    .await
+    .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
 
     let host = container
         .get_host()

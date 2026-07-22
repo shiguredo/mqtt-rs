@@ -18,8 +18,8 @@ use rcgen::{
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use shiguredo_container::core::{AccessMode, IntoContainerPort, Mount};
-use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use shiguredo_container::core::{AccessMode, ContainerPort, IntoContainerPort, Mount};
+use shiguredo_container::{AsyncRunner, ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep};
 use tokio_rustls::TlsConnector;
@@ -86,6 +86,33 @@ fn force_remove_container(id: &str) {
     }
 }
 
+/// コンテナポートをホストへ公開した `ContainerRequest` を返す。
+///
+/// - macOS: `with_exposed_port` が空きホストポートを自動割当する
+/// - Linux: `with_exposed_port` は PortBindings に載らないため、
+///   `with_mapped_port(0, …)` で Docker にランダム割当させる
+fn publish_ports(
+    image: GenericImage,
+    ports: impl IntoIterator<Item = ContainerPort>,
+) -> ContainerRequest<GenericImage> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut req: ContainerRequest<GenericImage> = image.into();
+        for port in ports {
+            req = req.with_mapped_port(0, port);
+        }
+        req
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut image = image;
+        for port in ports {
+            image = image.with_exposed_port(port);
+        }
+        image.into()
+    }
+}
+
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
 /// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある。
@@ -115,8 +142,7 @@ impl Drop for MosquittoGuard {
 /// Linux ではログ待機が未対応のため、TCP ポーリングで待ち受け開始を確認する。
 pub async fn start_mosquitto() -> MosquittoGuard {
     let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
-        .with_exposed_port(1883.tcp())
+    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [1883.tcp()])
         .with_cmd(["mosquitto", "-c", "/mosquitto-no-auth.conf"])
         .start()
         .await
@@ -217,8 +243,7 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
 
     // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
     let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
-        .with_exposed_port(8883.tcp())
+    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [8883.tcp()])
         .with_cmd(["mosquitto", "-c", conf_path.as_str()])
         .with_mount(
             Mount::bind_mount(temp_dir.path().to_string_lossy(), "/mosquitto/config")
@@ -328,12 +353,13 @@ const SCRAM_AUTHENTICATOR_ID_ENCODED: &str = "scram%3Abuilt_in_database";
 /// EMQX は起動途中で 1883 だけ bind した段階では CONNECT を Connection reset で
 /// 落とすため、TCP 待ちだけでは不十分である。
 pub async fn start_emqx_scram() -> EmqxScramGuard {
-    let container = GenericImage::new("emqx/emqx", "5.8.8")
-        .with_exposed_port(1883.tcp())
-        .with_exposed_port(18083.tcp())
-        .start()
-        .await
-        .expect("SCRAM 用 EMQX コンテナの起動に成功すること");
+    let container = publish_ports(
+        GenericImage::new("emqx/emqx", "5.8.8"),
+        [1883.tcp(), 18083.tcp()],
+    )
+    .start()
+    .await
+    .expect("SCRAM 用 EMQX コンテナの起動に成功すること");
 
     let host = container
         .get_host()
@@ -597,12 +623,13 @@ pub async fn start_emqx() -> EmqxGuard {
     // Connection reset by peer で切断される。Linux ではログ待機が
     // 未対応のため、Dashboard `/status` が HTTP 200 になるまで待って
     // フル起動を確認する。
-    let container = GenericImage::new("emqx/emqx", "5.8.8")
-        .with_exposed_port(1883.tcp())
-        .with_exposed_port(18083.tcp())
-        .start()
-        .await
-        .expect("EMQX コンテナの起動に成功すること");
+    let container = publish_ports(
+        GenericImage::new("emqx/emqx", "5.8.8"),
+        [1883.tcp(), 18083.tcp()],
+    )
+    .start()
+    .await
+    .expect("EMQX コンテナの起動に成功すること");
     let host = container
         .get_host()
         .await
@@ -697,37 +724,36 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         generated.server_key_pem.as_bytes(),
     );
 
-    let container = GenericImage::new("emqx/emqx", "5.8.8")
-        // QUIC は UDP なので UDP ポートとして expose する必要がある。
-        .with_exposed_port(14567.udp())
-        // フル起動判定用に Dashboard も公開する (Linux ではログ待機不可)。
-        .with_exposed_port(18083.tcp())
-        // 以下は QUIC listener を有効化するための環境変数。
-        // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
-        // （etc/examples/listeners.quic.conf.example を参照）。
-        // したがって env override は SSL_OPTIONS を挟む必要がある。
-        // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
-        // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
-        .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
-        .with_env_var(
-            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
-            cert_env_path,
-        )
-        .with_env_var(
-            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
-            key_env_path,
-        )
-        .with_mount(
-            Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_mount(
-            Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .start()
-        .await
-        .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
+    let container = publish_ports(
+        GenericImage::new("emqx/emqx", "5.8.8"),
+        [14567.udp(), 18083.tcp()],
+    )
+    // 以下は QUIC listener を有効化するための環境変数。
+    // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
+    // （etc/examples/listeners.quic.conf.example を参照）。
+    // したがって env override は SSL_OPTIONS を挟む必要がある。
+    // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
+    // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
+    .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
+    .with_env_var(
+        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
+        cert_env_path,
+    )
+    .with_env_var(
+        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
+        key_env_path,
+    )
+    .with_mount(
+        Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
+            .with_access_mode(AccessMode::ReadOnly),
+    )
+    .with_mount(
+        Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
+            .with_access_mode(AccessMode::ReadOnly),
+    )
+    .start()
+    .await
+    .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
 
     let host = container
         .get_host()

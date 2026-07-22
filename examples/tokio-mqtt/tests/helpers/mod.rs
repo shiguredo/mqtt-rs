@@ -18,8 +18,8 @@ use rcgen::{
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use shiguredo_container::core::{AccessMode, IntoContainerPort, Mount};
-use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use shiguredo_container::core::{AccessMode, ContainerPort, IntoContainerPort, Mount};
+use shiguredo_container::{AsyncRunner, ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep};
 use tokio_rustls::TlsConnector;
@@ -85,6 +85,33 @@ fn force_remove_container(id: &str) {
     }
 }
 
+/// コンテナポートをホストへ公開した `ContainerRequest` を返す。
+///
+/// - macOS: `with_exposed_port` が空きホストポートを自動割当する
+/// - Linux: `with_exposed_port` は PortBindings に載らないため、
+///   `with_mapped_port(0, …)` で Docker にランダム割当させる
+fn publish_ports(
+    image: GenericImage,
+    ports: impl IntoIterator<Item = ContainerPort>,
+) -> ContainerRequest<GenericImage> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut req: ContainerRequest<GenericImage> = image.into();
+        for port in ports {
+            req = req.with_mapped_port(0, port);
+        }
+        req
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut image = image;
+        for port in ports {
+            image = image.with_exposed_port(port);
+        }
+        image.into()
+    }
+}
+
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
 /// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある。
@@ -112,8 +139,7 @@ impl Drop for MosquittoGuard {
 /// Linux ではログ待機が未対応のため、TCP ポーリングで待ち受け開始を確認する。
 pub async fn start_mosquitto() -> MosquittoGuard {
     let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
-        .with_exposed_port(1883.tcp())
+    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [1883.tcp()])
         .with_cmd(["mosquitto", "-c", "/mosquitto-no-auth.conf"])
         .start()
         .await
@@ -214,8 +240,7 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
 
     // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
     let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
-        .with_exposed_port(8883.tcp())
+    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [8883.tcp()])
         .with_cmd(["mosquitto", "-c", conf_path.as_str()])
         .with_mount(
             Mount::bind_mount(temp_dir.path().to_string_lossy(), "/mosquitto/config")
