@@ -3,7 +3,7 @@
 - mqtt-rs は MQTT クライアント専用ライブラリとして実装すること
   - サーバー・ブローカー・リスナーの実装は行わない
   - クライアントとして不要な機能（例: 複数クライアントの同時受け入れ、トピックのサーバー側ルーティング）は追加しない
-- E2E テストは Docker が必要。既定の workspace test（prek: `cargo test --workspace --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt` / CI: `cargo test --workspace --all-features --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt`）では実行しない
+- E2E テストはコンテナランタイムが必要（macOS: Apple container、Linux: Docker Engine。`shiguredo_container` を利用）。既定の workspace test（prek: `cargo test --workspace --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt` / CI: `cargo test --workspace --all-features --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt`）では実行しない
 - E2E テストの明示実行は `RUST_TEST_THREADS=1 cargo test -p e2e-tests -p quic-mqtt -p tokio-mqtt`（ローカルでも CI でも同じ）
 - バージョンが 2026.0.0 の間は CHANGES.md を更新しないこと
 - バージョンが 2026.0.0 の間はブランチを作らず develop で 1 issue 1 コミットとして進めること

@@ -103,7 +103,7 @@ pass_filenames = false
 priority = 10
 
 # cargo test: コミットを遅くしないため pre-push でだけ実行する
-# e2e-tests / quic-mqtt / tokio-mqtt は Docker が必要なため除外する (CODEBASE.md)
+# e2e-tests / quic-mqtt / tokio-mqtt はコンテナランタイムが必要なため除外する (CODEBASE.md)
 [[repos.hooks]]
 id = "cargo-test"
 name = "cargo test"

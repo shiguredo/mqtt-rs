@@ -287,9 +287,9 @@ codec エラーを無視して接続を継続するかは MQTT バージョン�
 
 ## テスト
 
-- 通常の workspace テストには Docker 必須の E2E を含めない。
+- 通常の workspace テストにはコンテナランタイム必須の E2E を含めない。
 - 既定確認は `cargo test --workspace --exclude e2e-tests --exclude quic-mqtt --exclude tokio-mqtt` を使う。
-- E2E は Docker を用意し、`RUST_TEST_THREADS=1 cargo test -p e2e-tests -p quic-mqtt -p tokio-mqtt` で明示実行する。
+- E2E は `shiguredo_container`（macOS: Apple container、Linux: Docker Engine）を使い、`RUST_TEST_THREADS=1 cargo test -p e2e-tests -p quic-mqtt -p tokio-mqtt` で明示実行する。
 - codec のラウンドトリップや状態機械の性質は `pbt/`、任意入力へのクラッシュ耐性は `fuzz/` を使う。
 - モックやスタブを使わない。
 

@@ -58,8 +58,6 @@ default-features = false
 features = ["aws_lc_rs", "pem"]
 
 # EMQX コンテナを起動して MQTT over QUIC の smoke test を行うために使用
-# default features の "ring" を切り、bollard の rustls backend も aws-lc-rs に揃える
-[dev-dependencies.testcontainers-modules]
-version = "0.15"
-default-features = false
-features = ["aws-lc-rs"]
+# macOS では Apple container、Linux では Docker Engine API を利用する
+[dev-dependencies.shiguredo_container]
+version = "2026.1.0-canary.0"

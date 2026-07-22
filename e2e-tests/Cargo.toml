@@ -57,12 +57,10 @@ version = "1.83"
 default-features = false
 features = ["provider-address-token-default", "provider-tls-rustls"]
 
-# Docker コンテナで実 MQTT ブローカー (Mosquitto) を起動するため
-# default features の "ring" を切り、bollard の rustls backend も aws-lc-rs に揃える
-[dependencies.testcontainers-modules]
-version = "0.15"
-default-features = false
-features = ["aws-lc-rs", "mosquitto"]
+# コンテナで実 MQTT ブローカー (Mosquitto / EMQX) を起動するため
+# macOS では Apple container、Linux では Docker Engine API を利用する
+[dependencies.shiguredo_container]
+version = "2026.1.0-canary.0"
 
 # MQTT over TLS (mqtts) の E2E smoke test 用 tokio ↔ rustls ブリッジ
 [dependencies.tokio-rustls]

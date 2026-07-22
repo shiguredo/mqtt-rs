@@ -7,17 +7,84 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
 };
-use testcontainers_modules::mosquitto;
-use testcontainers_modules::testcontainers::core::{CopyDataSource, IntoContainerPort, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use rustls::ClientConfig;
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+use shiguredo_container::core::{AccessMode, IntoContainerPort, Mount};
+use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep};
+use tokio_rustls::TlsConnector;
+
+/// Mosquitto の ready 判定用に使うクライアント。
+use e2e_tests::v5::client::MqttClient as ProbeClient;
+
+/// コンテナ生存中にホスト側一時ディレクトリを保持し、Drop で削除する。
+///
+/// `shiguredo_container` の Linux 実装は `with_copy_to` 未対応のため、
+/// 証明書や設定は bind mount で渡す。マウント元が消えるとコンテナから
+/// 見えなくなるので、ガードに所有させてコンテナと同じ寿命にする。
+struct TempDirGuard(PathBuf);
+
+impl TempDirGuard {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 一意な一時ディレクトリを作成する。
+fn create_temp_dir(prefix: &str) -> TempDirGuard {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("システム時刻が UNIX_EPOCH 以降であること")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nanos));
+    fs::create_dir_all(&dir).expect("一時ディレクトリの作成に成功すること");
+    TempDirGuard(dir)
+}
+
+/// 一時ディレクトリ配下にファイルを書き出す。
+fn write_temp_file(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, contents).expect("一時ファイルの書き出しに成功すること");
+    path
+}
+
+/// コンテナランタイム向けに、指定 ID のコンテナを同期的に削除する。
+///
+/// `ContainerAsync` の Drop は tokio Runtime 内だと削除スレッドを join しないため、
+/// 連続 E2E で孤立コンテナが溜まり得る。ガードの Drop から明示的に掃除する。
+fn force_remove_container(id: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("container")
+            .args(["stop", id])
+            .output();
+        let _ = std::process::Command::new("container")
+            .args(["rm", id])
+            .output();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
+}
 
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
@@ -25,14 +92,32 @@ use tokio::time::{Instant, sleep};
 /// モジュール冒頭の `#![allow(dead_code)]` により、参照されないことによる
 /// warning は抑制される。
 pub struct MosquittoGuard {
-    pub container: ContainerAsync<mosquitto::Mosquitto>,
+    container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
     pub port: u16,
 }
 
+impl Drop for MosquittoGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let id = container.id().to_string();
+            drop(container);
+            force_remove_container(&id);
+        }
+    }
+}
+
 /// Mosquitto コンテナを起動し、生存期間を保ちながら (host, port) を返す。
+///
+/// 平文 listener (1883) のみ。匿名接続を許可する `/mosquitto-no-auth.conf` を使う。
+/// イメージタグは CI 再現性のため固定する。
+///
+/// Linux ではログ待機が未対応のため、TCP ポーリングで待ち受け開始を確認する。
 pub async fn start_mosquitto() -> MosquittoGuard {
-    let container = mosquitto::Mosquitto::default()
+    let tag = "2.0.18";
+    let container = GenericImage::new("eclipse-mosquitto", tag)
+        .with_exposed_port(1883.tcp())
+        .with_cmd(["mosquitto", "-c", "/mosquitto-no-auth.conf"])
         .start()
         .await
         .expect("Mosquitto コンテナの起動に成功すること");
@@ -42,13 +127,13 @@ pub async fn start_mosquitto() -> MosquittoGuard {
         .expect("コンテナのホスト名の取得に成功すること")
         .to_string();
     let port = container
-        .get_host_port_ipv4(1883)
+        .get_host_port_ipv4(1883.tcp())
         .await
         .expect("コンテナの 1883 ポート番号の取得に成功すること");
-    // TCP レベルで待ち受けが始まるまでポーリングで待つ。
-    wait_for_broker(&host, port, "Mosquitto").await;
+    // Linux ではログ待機が未対応のため、TCP のあと MQTT CONNECT で ready を確認する。
+    wait_for_mosquitto_mqtt(&host, port).await;
     MosquittoGuard {
-        container,
+        container: Some(container),
         host,
         port,
     }
@@ -58,8 +143,11 @@ pub async fn start_mosquitto() -> MosquittoGuard {
 ///
 /// `ca_pem` はクライアント側の rustls RootCertStore に渡す CA 証明書 (PEM)。
 /// `server_name` はサーバー証明書の SAN/CN であり、TLS ハンドシェイクの SNI に使う。
+/// `_temp_dir` は bind mount 元の設定・証明書をコンテナ生存中に保持する。
 pub struct MosquittoTlsGuard {
-    pub container: ContainerAsync<GenericImage>,
+    container: Option<ContainerAsync<GenericImage>>,
+    /// bind mount 元。フィールド参照はしないが Drop まで保持する必要がある。
+    _temp_dir: TempDirGuard,
     pub host: String,
     /// ホスト側にマップされた 8883/tcp ポート。
     pub port: u16,
@@ -67,22 +155,38 @@ pub struct MosquittoTlsGuard {
     pub server_name: String,
 }
 
+impl Drop for MosquittoTlsGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let id = container.id().to_string();
+            drop(container);
+            force_remove_container(&id);
+        }
+    }
+}
+
 /// TLS listener (8883) を有効化した Mosquitto コンテナを起動する。
 ///
-/// `testcontainers_modules::mosquitto` は平文専用の `/mosquitto-no-auth.conf` を
-/// 使うため、TLS 用には同じイメージ (`eclipse-mosquitto:2.0.18`) を
-/// `GenericImage` で起動し、rcgen で生成した証明書と自前の `mosquitto.conf` を
-/// 注入する。クライアントは dangerous verifier ではなく、この CA を trust root
-/// として正規に検証する。
+/// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
+/// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
+/// 証明書と自前の `mosquitto.conf` をホスト側一時ディレクトリへ書き出して
+/// bind mount する。クライアントは dangerous verifier ではなく、この CA を
+/// trust root として正規に検証する。
+///
+/// Linux では `with_copy_to` が未対応のため bind mount を使う。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
 
     // eclipse-mosquitto イメージの慣習に合わせ、設定と証明書を
     // /mosquitto/config/ 配下へ配置する。
-    let conf_path = "/mosquitto/config/mosquitto.conf";
-    let ca_path = "/mosquitto/config/ca.pem";
-    let cert_path = "/mosquitto/config/server.pem";
-    let key_path = "/mosquitto/config/server.key";
+    let conf_name = "mosquitto.conf";
+    let ca_name = "ca.pem";
+    let cert_name = "server.pem";
+    let key_name = "server.key";
+    let conf_path = format!("/mosquitto/config/{conf_name}");
+    let ca_path = format!("/mosquitto/config/{ca_name}");
+    let cert_path = format!("/mosquitto/config/{cert_name}");
+    let key_path = format!("/mosquitto/config/{key_name}");
 
     // listener 8883 のみを公開する。平文 1883 は立てない。
     // Mosquitto 2.x は既定で匿名接続を拒否するため allow_anonymous true が必要。
@@ -97,26 +201,28 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
          persistence false\n"
     );
 
-    // testcontainers_modules::mosquitto と同じタグに固定し、CI の再現性を保つ。
+    let temp_dir = create_temp_dir("mqtt-rs-mosquitto-tls");
+    write_temp_file(temp_dir.path(), conf_name, mosquitto_conf.as_bytes());
+    write_temp_file(temp_dir.path(), ca_name, generated.ca_pem.as_bytes());
+    write_temp_file(
+        temp_dir.path(),
+        cert_name,
+        generated.server_cert_pem.as_bytes(),
+    );
+    write_temp_file(
+        temp_dir.path(),
+        key_name,
+        generated.server_key_pem.as_bytes(),
+    );
+
+    // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
     let tag = "2.0.18";
     let container = GenericImage::new("eclipse-mosquitto", tag)
         .with_exposed_port(8883.tcp())
-        .with_wait_for(WaitFor::message_on_stderr(format!(
-            "mosquitto version {tag} running"
-        )))
-        .with_cmd(["mosquitto", "-c", conf_path])
-        .with_copy_to(conf_path, CopyDataSource::Data(mosquitto_conf.into_bytes()))
-        .with_copy_to(
-            ca_path,
-            CopyDataSource::Data(generated.ca_pem.clone().into_bytes()),
-        )
-        .with_copy_to(
-            cert_path,
-            CopyDataSource::Data(generated.server_cert_pem.into_bytes()),
-        )
-        .with_copy_to(
-            key_path,
-            CopyDataSource::Data(generated.server_key_pem.into_bytes()),
+        .with_cmd(["mosquitto", "-c", conf_path.as_str()])
+        .with_mount(
+            Mount::bind_mount(temp_dir.path().to_string_lossy(), "/mosquitto/config")
+                .with_access_mode(AccessMode::ReadOnly),
         )
         .start()
         .await
@@ -128,13 +234,16 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
         .expect("コンテナのホスト名の取得に成功すること")
         .to_string();
     let port = container
-        .get_host_port_ipv4(8883)
+        .get_host_port_ipv4(8883.tcp())
         .await
         .expect("コンテナの 8883 ポート番号の取得に成功すること");
-    // TLS ハンドシェイク前でも TCP accept は可能なので、平文と同様にポーリングする。
+    // TCP accept だけでは TLS 用証明書の読み込み前に接続して handshake EOF になる
+    // ことがある。Linux ではログ待機が未対応のため、TLS ハンドシェイク自体で待つ。
     wait_for_broker(&host, port, "Mosquitto TLS").await;
+    wait_for_tls_listener(&host, port, &generated.ca_pem, &generated.server_name).await;
     MosquittoTlsGuard {
-        container,
+        container: Some(container),
+        _temp_dir: temp_dir,
         host,
         port,
         ca_pem: generated.ca_pem,
@@ -148,9 +257,19 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
 /// （利用者からは参照しないが、モジュール冒頭の `#![allow(dead_code)]` により
 /// warning は抑制される）。
 pub struct EmqxGuard {
-    pub container: ContainerAsync<GenericImage>,
+    container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
     pub port: u16,
+}
+
+impl Drop for EmqxGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let id = container.id().to_string();
+            drop(container);
+            force_remove_container(&id);
+        }
+    }
 }
 
 /// SCRAM-SHA-256 Enhanced Authentication 用 EMQX コンテナのガード。
@@ -158,7 +277,7 @@ pub struct EmqxGuard {
 /// Dashboard (18083) 経由で SCRAM authenticator とテストユーザーを注入する。
 /// `container` は Drop 時の停止のために保持する。
 pub struct EmqxScramGuard {
-    pub container: ContainerAsync<GenericImage>,
+    container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
     /// ホスト側にマップされた MQTT 1883/tcp ポート。
     pub port: u16,
@@ -168,6 +287,16 @@ pub struct EmqxScramGuard {
     pub scram_user_id: &'static str,
     /// SCRAM 認証に使うテストパスワード (ASCII)。
     pub scram_password: &'static str,
+}
+
+impl Drop for EmqxScramGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let id = container.id().to_string();
+            drop(container);
+            force_remove_container(&id);
+        }
+    }
 }
 
 /// SCRAM E2E 用のテストユーザー ID。SASLprep 対象外の ASCII 定数。
@@ -190,16 +319,18 @@ const SCRAM_AUTHENTICATOR_ID_ENCODED: &str = "scram%3Abuilt_in_database";
 /// 既存の [`start_emqx`] は触らず、Dashboard HTTP API で認証設定を行う。
 /// 手順:
 /// 1. コンテナ起動 (1883 + 18083)
-/// 2. MQTT 待ち (`"is running now!"` + TCP)
-/// 3. Dashboard ready (`GET /status` が HTTP 200)
-/// 4. `POST /api/v5/login` → Bearer token
-/// 5. 既定チェーンに妨害 authenticator があれば削除 (実測: 既定は空のため何もしない)
-/// 6. SCRAM authenticator 作成 → テストユーザー登録
+/// 2. MQTT 待ち (TCP) + Dashboard ready (`GET /status` が HTTP 200)
+/// 3. `POST /api/v5/login` → Bearer token
+/// 4. 既定チェーンに妨害 authenticator があれば削除 (実測: 既定は空のため何もしない)
+/// 5. SCRAM authenticator 作成 → テストユーザー登録
+///
+/// Linux ではログ待機が未対応のため、Dashboard `/status` でフル起動を確認する。
+/// EMQX は起動途中で 1883 だけ bind した段階では CONNECT を Connection reset で
+/// 落とすため、TCP 待ちだけでは不十分である。
 pub async fn start_emqx_scram() -> EmqxScramGuard {
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(1883.tcp())
         .with_exposed_port(18083.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("is running now!"))
         .start()
         .await
         .expect("SCRAM 用 EMQX コンテナの起動に成功すること");
@@ -210,11 +341,11 @@ pub async fn start_emqx_scram() -> EmqxScramGuard {
         .expect("コンテナのホスト名の取得に成功すること")
         .to_string();
     let port = container
-        .get_host_port_ipv4(1883)
+        .get_host_port_ipv4(1883.tcp())
         .await
         .expect("コンテナの 1883 ポート番号の取得に成功すること");
     let dashboard_port = container
-        .get_host_port_ipv4(18083)
+        .get_host_port_ipv4(18083.tcp())
         .await
         .expect("コンテナの 18083 ポート番号の取得に成功すること");
 
@@ -240,7 +371,7 @@ pub async fn start_emqx_scram() -> EmqxScramGuard {
     .await;
 
     EmqxScramGuard {
-        container,
+        container: Some(container),
         host,
         port,
         dashboard_port,
@@ -252,6 +383,8 @@ pub async fn start_emqx_scram() -> EmqxScramGuard {
 /// Dashboard の `GET /status` が HTTP 200 になるまでポーリングする。
 ///
 /// `/api/v5/status` は存在しない。login は ready 判定に使わない。
+/// EMQX が CONNECT を受け付けられる状態になったことの代理指標としても使う
+/// (Linux ではログ待機が使えないため)。
 async fn wait_for_dashboard(host: &str, dashboard_port: u16) {
     let url = format!("http://{host}:{dashboard_port}/status");
     let http = reqwest::Client::new();
@@ -452,7 +585,6 @@ async fn create_scram_user(
 
 /// EMQX コンテナを起動し、生存期間を保ちながら (host, port) を返す。
 ///
-/// testcontainers-modules 0.15 には EMQX 用の専用モジュールが存在しないため、
 /// `GenericImage` から `emqx/emqx` イメージを直接組み立てて起動する。
 /// イメージの参照元は emqx/emqx-docker (<https://github.com/emqx/emqx-docker>)。
 pub async fn start_emqx() -> EmqxGuard {
@@ -462,13 +594,12 @@ pub async fn start_emqx() -> EmqxGuard {
     //
     // EMQX は起動時、まず 1883 の TCP リスナーだけを bind した状態で
     // アプリケーション初期化を続ける。この時点で CONNECT を送ると
-    // Connection reset by peer で切断されるため、標準出力に
-    // "is running now!" が現れるまで待つことで、MQTT サービスが
-    // CONNECT を受け付けられる状態になったことを保証する。
-    // バージョン非依存にするため、バージョン部分は含めず部分一致で待つ。
+    // Connection reset by peer で切断される。Linux ではログ待機が
+    // 未対応のため、Dashboard `/status` が HTTP 200 になるまで待って
+    // フル起動を確認する。
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(1883.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("is running now!"))
+        .with_exposed_port(18083.tcp())
         .start()
         .await
         .expect("EMQX コンテナの起動に成功すること");
@@ -478,14 +609,17 @@ pub async fn start_emqx() -> EmqxGuard {
         .expect("コンテナのホスト名の取得に成功すること")
         .to_string();
     let port = container
-        .get_host_port_ipv4(1883)
+        .get_host_port_ipv4(1883.tcp())
         .await
         .expect("コンテナの 1883 ポート番号の取得に成功すること");
-    // EMQX は起動から MQTT リスナーが上がるまでに数秒かかるため、
-    // TCP 接続が成功するまでポーリングで待つ。
+    let dashboard_port = container
+        .get_host_port_ipv4(18083.tcp())
+        .await
+        .expect("コンテナの 18083 ポート番号の取得に成功すること");
     wait_for_broker(&host, port, "EMQX").await;
+    wait_for_dashboard(&host, dashboard_port).await;
     EmqxGuard {
-        container,
+        container: Some(container),
         host,
         port,
     }
@@ -498,8 +632,11 @@ pub async fn start_emqx() -> EmqxGuard {
 /// `ca_pem` はクライアント側の TLS 設定に trust anchor として渡す、
 /// テスト実行時に生成した自己署名 CA 証明書 (PEM)。s2n-quic の
 /// rustls provider の `with_certificate(&str)` にそのまま渡せる形式。
+/// `_temp_dir` は bind mount 元の証明書をコンテナ生存中に保持する。
 pub struct EmqxQuicGuard {
-    pub container: ContainerAsync<GenericImage>,
+    container: Option<ContainerAsync<GenericImage>>,
+    /// bind mount 元。フィールド参照はしないが Drop まで保持する必要がある。
+    _temp_dir: TempDirGuard,
     pub host: String,
     pub udp_port: u16,
     pub ca_pem: String,
@@ -507,21 +644,33 @@ pub struct EmqxQuicGuard {
     pub server_name: String,
 }
 
+impl Drop for EmqxQuicGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let id = container.id().to_string();
+            drop(container);
+            force_remove_container(&id);
+        }
+    }
+}
+
 /// QUIC リスナーを有効化した EMQX コンテナを起動する。
 ///
 /// EMQX 5 系の既定では QUIC リスナーは無効なため、環境変数で明示的に
 /// 有効化する。証明書はイメージ同梱の例示証明書ではなく、`rcgen` で
-/// 生成した自前の CA と server 証明書を都度コンテナへ注入する。こうする
-/// ことで、クライアント側は無検証 (dangerous verifier) ではなく、正規に
-/// この CA を trust root として検証できる。
+/// 生成した自前の CA と server 証明書を都度ホストへ書き出して bind mount
+/// する。こうすることで、クライアント側は無検証 (dangerous verifier)
+/// ではなく、正規にこの CA を trust root として検証できる。
 ///
 /// QUIC の既定ポートは 14567/udp、ALPN は `"mqtt"`（EMQX の quicer
 /// listener 実装で確定）。TCP 版 (`start_emqx`) と関数を分けているのは、
 /// QUIC 用の環境変数と UDP ポートの expose を明示的にすることで、意図
 /// しないテストで QUIC リスナーが立ち上がる副作用を避けるため。
+///
+/// Linux では `with_copy_to` / ログ待機が未対応のため、証明書はファイル単位の
+/// bind mount、起動完了は Dashboard `/status` で確認する。
 pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // localhost 向けの CA と server 証明書を rcgen で生成する。
-    // testcontainers 経由でコンテナに copy して EMQX に読み込ませる。
     let generated = generate_localhost_certs();
 
     // コンテナ内で EMQX が読み取れる場所に証明書を配置する。EMQX の
@@ -529,17 +678,30 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // /opt/emqx/etc/certs/ 配下に置き、環境変数側は WorkingDir 相対の
     // "etc/certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
     // 衝突しないように "quic-*.pem" とする。
+    // ディレクトリ全体を mount すると同梱証明書を隠してしまうため、
+    // 追加ファイルだけをファイル単位で bind mount する。
     let cert_container_path = "/opt/emqx/etc/certs/quic-cert.pem";
     let key_container_path = "/opt/emqx/etc/certs/quic-key.pem";
     let cert_env_path = "etc/certs/quic-cert.pem";
     let key_env_path = "etc/certs/quic-key.pem";
 
+    let temp_dir = create_temp_dir("mqtt-rs-emqx-quic");
+    let host_cert = write_temp_file(
+        temp_dir.path(),
+        "quic-cert.pem",
+        generated.server_cert_pem.as_bytes(),
+    );
+    let host_key = write_temp_file(
+        temp_dir.path(),
+        "quic-key.pem",
+        generated.server_key_pem.as_bytes(),
+    );
+
     let container = GenericImage::new("emqx/emqx", "5.8.8")
-        // 標準の MQTT/TCP リスナー起動後に QUIC listener 起動ログが出るため、
-        // TCP smoke test と同様に "is running now!" を待つ。
-        .with_wait_for(WaitFor::message_on_stdout("is running now!"))
         // QUIC は UDP なので UDP ポートとして expose する必要がある。
         .with_exposed_port(14567.udp())
+        // フル起動判定用に Dashboard も公開する (Linux ではログ待機不可)。
+        .with_exposed_port(18083.tcp())
         // 以下は QUIC listener を有効化するための環境変数。
         // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
         // （etc/examples/listeners.quic.conf.example を参照）。
@@ -555,14 +717,13 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
             "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
             key_env_path,
         )
-        // rcgen で生成した cert/key をコンテナに copy する。
-        .with_copy_to(
-            cert_container_path,
-            CopyDataSource::Data(generated.server_cert_pem.into_bytes()),
+        .with_mount(
+            Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
+                .with_access_mode(AccessMode::ReadOnly),
         )
-        .with_copy_to(
-            key_container_path,
-            CopyDataSource::Data(generated.server_key_pem.into_bytes()),
+        .with_mount(
+            Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
+                .with_access_mode(AccessMode::ReadOnly),
         )
         .start()
         .await
@@ -579,12 +740,17 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         .get_host_port_ipv4(14567.udp())
         .await
         .expect("コンテナの 14567/udp ポート番号の取得に成功すること");
+    let dashboard_port = container
+        .get_host_port_ipv4(18083.tcp())
+        .await
+        .expect("コンテナの 18083 ポート番号の取得に成功すること");
 
     // QUIC は UDP のため wait_for_broker のような TCP ポーリングは行わず、
-    // WaitFor::message_on_stdout の完了時点で QUIC listener が起動して
-    // いることを "Listener quic:default on :14567 started." のログで確認済み。
+    // Dashboard が応答した時点で listener 群が起動していることを確認する。
+    wait_for_dashboard(&host, dashboard_port).await;
     EmqxQuicGuard {
-        container,
+        container: Some(container),
+        _temp_dir: temp_dir,
         host,
         udp_port,
         ca_pem: generated.ca_pem,
@@ -655,6 +821,64 @@ async fn wait_for_broker(host: &str, port: u16, service_name: &str) {
                 "{} が {} ポートで待ち受けるまでのタイムアウト",
                 service_name, port
             );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Mosquitto が MQTT CONNECT を受理するまでポーリングで待つ。
+///
+/// TCP accept 開始直後はプロトコル処理前で CONNECT が切断されることがある。
+/// Linux ではログ待機が未対応のため、実際の MQTT ハンドシェイクで ready を確認する。
+async fn wait_for_mosquitto_mqtt(host: &str, port: u16) {
+    wait_for_broker(host, port, "Mosquitto").await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
+        let client_id = format!("mqtt-rs-ready-{attempt}");
+        if let Ok(mut client) = ProbeClient::connect_tcp(host, port).await
+            && client.connect_v5(&client_id).await.is_ok()
+        {
+            let _ = client.disconnect().await;
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("Mosquitto が MQTT CONNECT を受理するまでのタイムアウト");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Mosquitto mqtts が TLS ハンドシェイクを完了できるまでポーリングで待つ。
+///
+/// TCP 待ち受け開始直後は証明書未準備などで handshake が EOF / reset になる
+/// ことがある。成功した接続はすぐに閉じる (ready 判定専用)。
+async fn wait_for_tls_listener(host: &str, port: u16, ca_pem: &str, server_name: &str) {
+    let mut roots = RootCertStore::empty();
+    let ca = CertificateDer::from_pem_slice(ca_pem.as_bytes())
+        .expect("CA 証明書 PEM のパースに成功すること");
+    roots
+        .add(ca)
+        .expect("CA 証明書を RootCertStore に登録できること");
+    let connector = TlsConnector::from(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let name = ServerName::try_from(server_name.to_string())
+        .expect("server_name が ServerName として妥当であること");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(tcp) = TcpStream::connect((host, port)).await {
+            let _ = tcp.set_nodelay(true);
+            if connector.connect(name.clone(), tcp).await.is_ok() {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("Mosquitto TLS がハンドシェイク可能になるまでのタイムアウト");
         }
         sleep(Duration::from_millis(100)).await;
     }

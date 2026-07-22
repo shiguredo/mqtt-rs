@@ -1,6 +1,6 @@
 //! Mosquitto ブローカーに対する接続テスト。
 //!
-//! Docker が必要なため、既定の workspace test からは除外する (CODEBASE.md)。
+//! コンテナランタイムが必要なため、既定の workspace test からは除外する (CODEBASE.md)。
 
 mod helpers;
 

@@ -1,6 +1,6 @@
 //! MQTT v5.0 の基本シナリオを MQTT over TCP (Mosquitto) 上で検証する。
 //!
-//! Docker が必要なため、既定の workspace test からは除外する (CODEBASE.md)。
+//! コンテナランタイムが必要なため、既定の workspace test からは除外する (CODEBASE.md)。
 
 mod helpers;
 
