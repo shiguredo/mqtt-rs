@@ -15,6 +15,7 @@ use rcgen::{
 use shiguredo_container::core::IntoContainerPort;
 use shiguredo_container::core::wait::HttpWaitStrategy;
 use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
+use tokio::time::{Instant, sleep};
 
 /// Mosquitto が listener 受付可能になったことを示すログ断片。
 ///
@@ -281,6 +282,8 @@ const SCRAM_AUTHENTICATOR_ID_ENCODED: &str = "scram%3Abuilt_in_database";
 ///
 /// EMQX は起動途中で 1883 だけ bind した段階では CONNECT を Connection reset で
 /// 落とすため、Dashboard ready をフル起動の代理指標とする。
+/// ただし `/status` 200 直後は SCRAM provider が未登録のことがあり、
+/// authenticator 作成は `no_available_provider_for` をリトライする。
 pub async fn start_emqx_scram() -> EmqxScramGuard {
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(1883.tcp())
@@ -446,6 +449,10 @@ async fn ensure_empty_authentication_chain(
 }
 
 /// SCRAM / built_in_database / sha256 authenticator を作成する。
+///
+/// Dashboard `/status` が HTTP 200 でも、認証 provider の登録が追いついていない
+/// ことがある。その場合 EMQX は `no_available_provider_for` を返すため、
+/// provider が利用可能になるまで短い間隔で再試行する。
 async fn create_scram_authenticator(
     http: &reqwest::Client,
     host: &str,
@@ -459,23 +466,32 @@ async fn create_scram_authenticator(
         "algorithm": "sha256",
         "iteration_count": 4096
     }"#;
-    let response = http
-        .post(&url)
-        .bearer_auth(token)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .expect("SCRAM authenticator 作成要求の送信に成功すること");
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .expect("SCRAM authenticator 作成応答の読み取りに成功すること");
-    assert!(
-        status.is_success(),
-        "SCRAM authenticator の作成が成功すること: status={status}, body={text}"
-    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = http
+            .post(&url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("SCRAM authenticator 作成要求の送信に成功すること");
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .expect("SCRAM authenticator 作成応答の読み取りに成功すること");
+        if status.is_success() {
+            return;
+        }
+        // 起動直後だけ起きる一時的な拒否。それ以外は即座に失敗させる。
+        let provider_not_ready =
+            status.as_u16() == 400 && text.contains("no_available_provider_for");
+        if !provider_not_ready || Instant::now() >= deadline {
+            panic!("SCRAM authenticator の作成が成功すること: status={status}, body={text}");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// SCRAM authenticator にテストユーザーを登録する。
