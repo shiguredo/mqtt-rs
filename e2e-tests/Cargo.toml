@@ -59,8 +59,10 @@ features = ["provider-address-token-default", "provider-tls-rustls"]
 
 # コンテナで実 MQTT ブローカー (Mosquitto / EMQX) を起動するため
 # macOS では Apple container、Linux では Docker Engine API を利用する
+# http_wait_plain: EMQX Dashboard の WaitFor::http に必要
 [dependencies.shiguredo_container]
-version = "2026.1.0-canary.0"
+version = "2026.1.0-canary.1"
+features = ["http_wait_plain"]
 
 # MQTT over TLS (mqtts) の E2E smoke test 用 tokio ↔ rustls ブリッジ
 [dependencies.tokio-rustls]

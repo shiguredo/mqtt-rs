@@ -1712,10 +1712,11 @@ dependencies = [
 
 [[package]]
 name = "shiguredo_container"
-version = "2026.1.0-canary.0"
+version = "2026.1.0-canary.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2f5ccd84f8e4b18db0fdb6f6e7d5111ab9c7d277b6a1611301ac8d639ed541"
+checksum = "5757d53313f0a872c56cb4b2e4f7d5e37b1f57ad265d1a311504b83accf6e5f8"
 dependencies = [
+ "base64ct",
  "cc",
  "libc",
  "nojson",

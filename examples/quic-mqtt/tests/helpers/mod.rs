@@ -7,54 +7,21 @@
 
 #![allow(dead_code)]
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
-};
-use shiguredo_container::core::{AccessMode, ContainerPort, IntoContainerPort, Mount};
-use shiguredo_container::{AsyncRunner, ContainerAsync, ContainerRequest, GenericImage, ImageExt};
-use tokio::time::{Instant, sleep};
+use shiguredo_container::core::IntoContainerPort;
+use shiguredo_container::core::wait::HttpWaitStrategy;
+use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 
 use quic_mqtt::client::MqttClient;
 
-/// コンテナ生存中にホスト側一時ディレクトリを保持し、Drop で削除する。
-///
-/// `shiguredo_container` の Linux 実装は `with_copy_to` 未対応のため、
-/// 証明書は bind mount で渡す。マウント元が消えるとコンテナから見えなくなるので、
-/// ガードに所有させてコンテナと同じ寿命にする。
-struct TempDirGuard(PathBuf);
-
-impl TempDirGuard {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// 一意な一時ディレクトリを作成する。
-fn create_temp_dir(prefix: &str) -> TempDirGuard {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("システム時刻が UNIX_EPOCH 以降であること")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nanos));
-    fs::create_dir_all(&dir).expect("一時ディレクトリの作成に成功すること");
-    TempDirGuard(dir)
-}
-
-/// 一時ディレクトリ配下にファイルを書き出す。
-fn write_temp_file(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, contents).expect("一時ファイルの書き出しに成功すること");
-    path
+/// EMQX Dashboard のフル起動判定 (`GET /status` が HTTP 200)。
+fn emqx_dashboard_ready() -> WaitFor {
+    WaitFor::http(
+        HttpWaitStrategy::new("/status")
+            .with_port(18083.tcp())
+            .with_expected_status_code(200_u16),
+    )
 }
 
 /// コンテナランタイム向けに、指定 ID のコンテナを同期的に削除する。
@@ -79,33 +46,6 @@ fn force_remove_container(id: &str) {
     }
 }
 
-/// コンテナポートをホストへ公開した `ContainerRequest` を返す。
-///
-/// - macOS: `with_exposed_port` が空きホストポートを自動割当する
-/// - Linux: `with_exposed_port` は PortBindings に載らないため、
-///   `with_mapped_port(0, …)` で Docker にランダム割当させる
-fn publish_ports(
-    image: GenericImage,
-    ports: impl IntoIterator<Item = ContainerPort>,
-) -> ContainerRequest<GenericImage> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut req: ContainerRequest<GenericImage> = image.into();
-        for port in ports {
-            req = req.with_mapped_port(0, port);
-        }
-        req
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut image = image;
-        for port in ports {
-            image = image.with_exposed_port(port);
-        }
-        image.into()
-    }
-}
-
 /// QUIC を有効化した EMQX コンテナの生存期間を保つためのガード。
 ///
 /// `container` は Drop 時にコンテナを停止するために保持する。
@@ -113,11 +53,8 @@ fn publish_ports(
 /// `ca_pem` はクライアント側の TLS 設定に trust anchor として渡す、
 /// テスト実行時に生成した自己署名 CA 証明書 (PEM)。s2n-quic の
 /// rustls provider の `with_certificate(&str)` にそのまま渡せる形式。
-/// `_temp_dir` は bind mount 元の証明書をコンテナ生存中に保持する。
 pub struct EmqxQuicGuard {
     container: Option<ContainerAsync<GenericImage>>,
-    /// bind mount 元。フィールド参照はしないが Drop まで保持する必要がある。
-    _temp_dir: TempDirGuard,
     pub host: String,
     pub udp_port: u16,
     pub ca_pem: String,
@@ -139,15 +76,15 @@ impl Drop for EmqxQuicGuard {
 ///
 /// EMQX 5 系の既定では QUIC リスナーは無効なため、環境変数で明示的に
 /// 有効化する。証明書はイメージ同梱の例示証明書ではなく、`rcgen` で
-/// 生成した自前の CA と server 証明書を都度ホストへ書き出して bind mount
-/// する。こうすることで、クライアント側は無検証 (dangerous verifier)
-/// ではなく、正規にこの CA を trust root として検証できる。
+/// 生成した自前の CA と server 証明書を `with_copy_to` で投入する。
+/// こうすることで、クライアント側は無検証 (dangerous verifier) ではなく、
+/// 正規にこの CA を trust root として検証できる。
 ///
 /// QUIC の既定ポートは 14567/udp、ALPN は `"mqtt"`（EMQX の quicer
 /// listener 実装で確定）。
 ///
-/// Linux では `with_copy_to` / ログ待機が未対応のため、証明書はファイル単位の
-/// bind mount、起動完了は Dashboard `/status` で確認する。
+/// `with_copy_to` は起動直後・ready 待機前に走る。EMQX の listener 設定は
+/// 起動シーケンス後半のため、証明書は読み取り前に揃う。
 pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // localhost 向けの CA と server 証明書を rcgen で生成する。
     let generated = generate_localhost_certs();
@@ -157,55 +94,36 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // /opt/emqx/etc/certs/ 配下に置き、環境変数側は WorkingDir 相対の
     // "etc/certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
     // 衝突しないように "quic-*.pem" とする。
-    // ディレクトリ全体を mount すると同梱証明書を隠してしまうため、
-    // 追加ファイルだけをファイル単位で bind mount する。
     let cert_container_path = "/opt/emqx/etc/certs/quic-cert.pem";
     let key_container_path = "/opt/emqx/etc/certs/quic-key.pem";
     let cert_env_path = "etc/certs/quic-cert.pem";
     let key_env_path = "etc/certs/quic-key.pem";
 
-    let temp_dir = create_temp_dir("mqtt-rs-quic-emqx");
-    let host_cert = write_temp_file(
-        temp_dir.path(),
-        "quic-cert.pem",
-        generated.server_cert_pem.as_bytes(),
-    );
-    let host_key = write_temp_file(
-        temp_dir.path(),
-        "quic-key.pem",
-        generated.server_key_pem.as_bytes(),
-    );
-
-    let container = publish_ports(
-        GenericImage::new("emqx/emqx", "5.8.8"),
-        [14567.udp(), 18083.tcp()],
-    )
-    // 以下は QUIC listener を有効化するための環境変数。
-    // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
-    // （etc/examples/listeners.quic.conf.example を参照）。
-    // したがって env override は SSL_OPTIONS を挟む必要がある。
-    // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
-    // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
-    .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
-    .with_env_var(
-        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
-        cert_env_path,
-    )
-    .with_env_var(
-        "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
-        key_env_path,
-    )
-    .with_mount(
-        Mount::bind_mount(host_cert.to_string_lossy(), cert_container_path)
-            .with_access_mode(AccessMode::ReadOnly),
-    )
-    .with_mount(
-        Mount::bind_mount(host_key.to_string_lossy(), key_container_path)
-            .with_access_mode(AccessMode::ReadOnly),
-    )
-    .start()
-    .await
-    .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
+    let container = GenericImage::new("emqx/emqx", "5.8.8")
+        .with_exposed_port(14567.udp())
+        .with_exposed_port(18083.tcp())
+        .with_wait_for(emqx_dashboard_ready())
+        .with_startup_timeout(Duration::from_secs(120))
+        // 以下は QUIC listener を有効化するための環境変数。
+        // EMQX の QUIC listener の証明書設定は `ssl_options` 配下にある
+        // （etc/examples/listeners.quic.conf.example を参照）。
+        // したがって env override は SSL_OPTIONS を挟む必要がある。
+        // 誤って直下の CERTFILE/KEYFILE を指定すると key が無視され、
+        // EMQX は同梱の例示証明書 (etc/certs/cert.pem) にフォールバックする。
+        .with_env_var("EMQX_LISTENERS__QUIC__DEFAULT__ENABLED", "true")
+        .with_env_var(
+            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE",
+            cert_env_path,
+        )
+        .with_env_var(
+            "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
+            key_env_path,
+        )
+        .with_copy_to(cert_container_path, generated.server_cert_pem.into_bytes())
+        .with_copy_to(key_container_path, generated.server_key_pem.into_bytes())
+        .start()
+        .await
+        .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
 
     let host = container
         .get_host()
@@ -218,59 +136,14 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         .get_host_port_ipv4(14567.udp())
         .await
         .expect("コンテナの 14567/udp ポート番号の取得に成功すること");
-    let dashboard_port = container
-        .get_host_port_ipv4(18083.tcp())
-        .await
-        .expect("コンテナの 18083 ポート番号の取得に成功すること");
 
-    // QUIC は UDP のため TCP ポーリングは行わず、
-    // Dashboard が応答した時点で listener 群が起動していることを確認する。
-    wait_for_dashboard(&host, dashboard_port).await;
     EmqxQuicGuard {
         container: Some(container),
-        _temp_dir: temp_dir,
         host,
         udp_port,
         ca_pem: generated.ca_pem,
         server_name: generated.server_name,
     }
-}
-
-/// Dashboard の `GET /status` が HTTP 200 になるまでポーリングする。
-///
-/// Linux ではログ待機が未対応のため、EMQX フル起動の代理指標として使う。
-async fn wait_for_dashboard(host: &str, dashboard_port: u16) {
-    let url = format!("http://{host}:{dashboard_port}/status");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(true) = http_get_status_is_200(&url).await {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("EMQX Dashboard が /status で HTTP 200 を返すまでのタイムアウト");
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// 素の HTTP/1.1 で `GET {url}` し、ステータスが 200 なら true を返す。
-///
-/// quic-mqtt は reqwest に依存しないため、tokio TcpStream で最小限の GET を行う。
-async fn http_get_status_is_200(url: &str) -> Result<bool, ()> {
-    // url は常に http://host:port/status 形式。
-    let without_scheme = url.strip_prefix("http://").ok_or(())?;
-    let (authority, path) = without_scheme.split_once('/').ok_or(())?;
-    let path = format!("/{path}");
-    let mut stream = tokio::net::TcpStream::connect(authority)
-        .await
-        .map_err(|_| ())?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream.write_all(request.as_bytes()).await.map_err(|_| ())?;
-    let mut body = Vec::new();
-    stream.read_to_end(&mut body).await.map_err(|_| ())?;
-    let text = String::from_utf8_lossy(&body);
-    Ok(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200"))
 }
 
 /// EMQX QUIC に接続し、MQTT CONNECT まで完了したクライアントを返す。
@@ -310,6 +183,11 @@ struct GeneratedCerts {
 /// `rcgen` で「自己署名 CA + それが署名した localhost 向けサーバー証明書」を
 /// 生成する。テストの都度新しく作るのでネットワークや状態への副作用は無い。
 fn generate_localhost_certs() -> GeneratedCerts {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa,
+        KeyPair,
+    };
+
     // CA (Certificate Authority) を生成する。
     let mut ca_params = CertificateParams::new(Vec::<String>::new())
         .expect("CA 用 CertificateParams の作成に成功すること");

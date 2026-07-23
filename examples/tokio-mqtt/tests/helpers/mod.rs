@@ -7,60 +7,27 @@
 
 #![allow(dead_code)]
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
-};
-use rustls::ClientConfig;
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use shiguredo_container::core::{AccessMode, ContainerPort, IntoContainerPort, Mount};
-use shiguredo_container::{AsyncRunner, ContainerAsync, ContainerRequest, GenericImage, ImageExt};
-use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep};
-use tokio_rustls::TlsConnector;
+use shiguredo_container::core::IntoContainerPort;
+use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 
 use tokio_mqtt::client::MqttClient;
 
-/// コンテナ生存中にホスト側一時ディレクトリを保持し、Drop で削除する。
+/// Mosquitto が listener 受付可能になったことを示すログ断片。
 ///
-/// `shiguredo_container` の Linux 実装は `with_copy_to` 未対応のため、
-/// 証明書や設定は bind mount で渡す。マウント元が消えるとコンテナから
-/// 見えなくなるので、ガードに所有させてコンテナと同じ寿命にする。
-struct TempDirGuard(PathBuf);
+/// `mosquitto version X.Y.Z starting` には含まれず、
+/// `mosquitto version X.Y.Z running` にだけ現れる。
+const MOSQUITTO_RUNNING_LOG: &str = "running";
 
-impl TempDirGuard {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
+/// `with_copy_to` はコンテナ起動後に走るため、投入完了を待つシェル。
+///
+/// イメージ同梱の `/mosquitto/config/mosquitto.conf` が既にあるため、
+/// conf の存在待ちだとコピー前に起動してしまう。同梱されない `server.key`
+/// の出現を完了合図にする。eclipse-mosquitto イメージ (Alpine) の `/bin/sh` を使う。
+const MOSQUITTO_WAIT_CONFIG_AND_EXEC: &str = "while [ ! -f /mosquitto/config/server.key ]; do sleep 0.05; done; exec mosquitto -c /mosquitto/config/mosquitto.conf";
 
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// 一意な一時ディレクトリを作成する。
-fn create_temp_dir(prefix: &str) -> TempDirGuard {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("システム時刻が UNIX_EPOCH 以降であること")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nanos));
-    fs::create_dir_all(&dir).expect("一時ディレクトリの作成に成功すること");
-    TempDirGuard(dir)
-}
-
-/// 一時ディレクトリ配下にファイルを書き出す。
-fn write_temp_file(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, contents).expect("一時ファイルの書き出しに成功すること");
-    path
+/// Mosquitto の listener 受付可能判定 (ログに `running` が出るまで)。
+fn mosquitto_ready() -> WaitFor {
+    WaitFor::message_on_either_std(MOSQUITTO_RUNNING_LOG)
 }
 
 /// コンテナランタイム向けに、指定 ID のコンテナを同期的に削除する。
@@ -82,33 +49,6 @@ fn force_remove_container(id: &str) {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", id])
             .output();
-    }
-}
-
-/// コンテナポートをホストへ公開した `ContainerRequest` を返す。
-///
-/// - macOS: `with_exposed_port` が空きホストポートを自動割当する
-/// - Linux: `with_exposed_port` は PortBindings に載らないため、
-///   `with_mapped_port(0, …)` で Docker にランダム割当させる
-fn publish_ports(
-    image: GenericImage,
-    ports: impl IntoIterator<Item = ContainerPort>,
-) -> ContainerRequest<GenericImage> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut req: ContainerRequest<GenericImage> = image.into();
-        for port in ports {
-            req = req.with_mapped_port(0, port);
-        }
-        req
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut image = image;
-        for port in ports {
-            image = image.with_exposed_port(port);
-        }
-        image.into()
     }
 }
 
@@ -136,10 +76,12 @@ impl Drop for MosquittoGuard {
 /// 平文 listener (1883) のみ。匿名接続を許可する `/mosquitto-no-auth.conf` を使う。
 /// イメージタグは CI 再現性のため固定する。
 ///
-/// Linux ではログ待機が未対応のため、TCP ポーリングで待ち受け開始を確認する。
+/// ready は `WaitFor` でログの `running` を待つ。
 pub async fn start_mosquitto() -> MosquittoGuard {
     let tag = "2.0.18";
-    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [1883.tcp()])
+    let container = GenericImage::new("eclipse-mosquitto", tag)
+        .with_exposed_port(1883.tcp())
+        .with_wait_for(mosquitto_ready())
         .with_cmd(["mosquitto", "-c", "/mosquitto-no-auth.conf"])
         .start()
         .await
@@ -153,8 +95,6 @@ pub async fn start_mosquitto() -> MosquittoGuard {
         .get_host_port_ipv4(1883.tcp())
         .await
         .expect("コンテナの 1883 ポート番号の取得に成功すること");
-    // Linux ではログ待機が未対応のため、TCP のあと MQTT CONNECT で ready を確認する。
-    wait_for_mosquitto_mqtt(&host, port).await;
     MosquittoGuard {
         container: Some(container),
         host,
@@ -166,11 +106,8 @@ pub async fn start_mosquitto() -> MosquittoGuard {
 ///
 /// `ca_pem` はクライアント側の rustls RootCertStore に渡す CA 証明書 (PEM)。
 /// `server_name` はサーバー証明書の SAN/CN であり、TLS ハンドシェイクの SNI に使う。
-/// `_temp_dir` は bind mount 元の設定・証明書をコンテナ生存中に保持する。
 pub struct MosquittoTlsGuard {
     container: Option<ContainerAsync<GenericImage>>,
-    /// bind mount 元。フィールド参照はしないが Drop まで保持する必要がある。
-    _temp_dir: TempDirGuard,
     pub host: String,
     /// ホスト側にマップされた 8883/tcp ポート。
     pub port: u16,
@@ -192,24 +129,21 @@ impl Drop for MosquittoTlsGuard {
 ///
 /// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
 /// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
-/// 証明書と自前の `mosquitto.conf` をホスト側一時ディレクトリへ書き出して
-/// bind mount する。クライアントは dangerous verifier ではなく、この CA を
-/// trust root として正規に検証する。
+/// 証明書と自前の `mosquitto.conf` を `with_copy_to` で投入する。
+/// クライアントは dangerous verifier ではなく、この CA を trust root として
+/// 正規に検証する。
 ///
-/// Linux では `with_copy_to` が未対応のため bind mount を使う。
+/// `with_copy_to` は起動後に走るため、CMD 側で設定ファイル出現を待ってから
+/// `mosquitto` を `exec` する。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
 
     // eclipse-mosquitto イメージの慣習に合わせ、設定と証明書を
     // /mosquitto/config/ 配下へ配置する。
-    let conf_name = "mosquitto.conf";
-    let ca_name = "ca.pem";
-    let cert_name = "server.pem";
-    let key_name = "server.key";
-    let conf_path = format!("/mosquitto/config/{conf_name}");
-    let ca_path = format!("/mosquitto/config/{ca_name}");
-    let cert_path = format!("/mosquitto/config/{cert_name}");
-    let key_path = format!("/mosquitto/config/{key_name}");
+    let conf_path = "/mosquitto/config/mosquitto.conf";
+    let ca_path = "/mosquitto/config/ca.pem";
+    let cert_path = "/mosquitto/config/server.pem";
+    let key_path = "/mosquitto/config/server.key";
 
     // listener 8883 のみを公開する。平文 1883 は立てない。
     // Mosquitto 2.x は既定で匿名接続を拒否するため allow_anonymous true が必要。
@@ -224,28 +158,18 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
          persistence false\n"
     );
 
-    let temp_dir = create_temp_dir("mqtt-rs-tokio-mosquitto-tls");
-    write_temp_file(temp_dir.path(), conf_name, mosquitto_conf.as_bytes());
-    write_temp_file(temp_dir.path(), ca_name, generated.ca_pem.as_bytes());
-    write_temp_file(
-        temp_dir.path(),
-        cert_name,
-        generated.server_cert_pem.as_bytes(),
-    );
-    write_temp_file(
-        temp_dir.path(),
-        key_name,
-        generated.server_key_pem.as_bytes(),
-    );
-
     // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
     let tag = "2.0.18";
-    let container = publish_ports(GenericImage::new("eclipse-mosquitto", tag), [8883.tcp()])
-        .with_cmd(["mosquitto", "-c", conf_path.as_str()])
-        .with_mount(
-            Mount::bind_mount(temp_dir.path().to_string_lossy(), "/mosquitto/config")
-                .with_access_mode(AccessMode::ReadOnly),
-        )
+    let container = GenericImage::new("eclipse-mosquitto", tag)
+        .with_exposed_port(8883.tcp())
+        .with_wait_for(mosquitto_ready())
+        .with_cmd(["/bin/sh", "-c", MOSQUITTO_WAIT_CONFIG_AND_EXEC])
+        .with_copy_to(conf_path, mosquitto_conf.into_bytes())
+        .with_copy_to(ca_path, generated.ca_pem.clone().into_bytes())
+        .with_copy_to(cert_path, generated.server_cert_pem.into_bytes())
+        // 既定 0644 のままにする。0600 + root 所有だと権限降下後の
+        // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
+        .with_copy_to(key_path, generated.server_key_pem.into_bytes())
         .start()
         .await
         .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
@@ -259,13 +183,8 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
         .get_host_port_ipv4(8883.tcp())
         .await
         .expect("コンテナの 8883 ポート番号の取得に成功すること");
-    // TCP accept だけでは TLS 用証明書の読み込み前に接続して handshake EOF になる
-    // ことがある。Linux ではログ待機が未対応のため、TLS ハンドシェイク自体で待つ。
-    wait_for_broker(&host, port, "Mosquitto TLS").await;
-    wait_for_tls_listener(&host, port, &generated.ca_pem, &generated.server_name).await;
     MosquittoTlsGuard {
         container: Some(container),
-        _temp_dir: temp_dir,
         host,
         port,
         ca_pem: generated.ca_pem,
@@ -322,6 +241,11 @@ struct GeneratedCerts {
 /// `rcgen` で「自己署名 CA + それが署名した localhost 向けサーバー証明書」を
 /// 生成する。テストの都度新しく作るのでネットワークや状態への副作用は無い。
 fn generate_localhost_certs() -> GeneratedCerts {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa,
+        KeyPair,
+    };
+
     // CA (Certificate Authority) を生成する。
     let mut ca_params = CertificateParams::new(Vec::<String>::new())
         .expect("CA 用 CertificateParams の作成に成功すること");
@@ -352,78 +276,5 @@ fn generate_localhost_certs() -> GeneratedCerts {
         server_cert_pem: server_cert.pem(),
         server_key_pem: server_key.serialize_pem(),
         server_name,
-    }
-}
-
-/// ブローカーが指定ポートで接続を受け付けるまでポーリングで待つ。
-async fn wait_for_broker(host: &str, port: u16, service_name: &str) {
-    let addr = format!("{host}:{port}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("{service_name} が {port} ポートで待ち受けるまでのタイムアウト");
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Mosquitto が MQTT CONNECT を受理するまでポーリングで待つ。
-///
-/// TCP accept 開始直後はプロトコル処理前で CONNECT が切断されることがある。
-/// Linux ではログ待機が未対応のため、実際の MQTT ハンドシェイクで ready を確認する。
-async fn wait_for_mosquitto_mqtt(host: &str, port: u16) {
-    wait_for_broker(host, port, "Mosquitto").await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempt = 0u64;
-    loop {
-        attempt += 1;
-        let client_id = format!("tokio-mqtt-ready-{attempt}");
-        if let Ok(mut client) = MqttClient::connect_tcp(host, port).await
-            && client.connect(&client_id, 60, true).await.is_ok()
-        {
-            let _ = client.disconnect().await;
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("Mosquitto が MQTT CONNECT を受理するまでのタイムアウト");
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Mosquitto mqtts が TLS ハンドシェイクを完了できるまでポーリングで待つ。
-///
-/// TCP 待ち受け開始直後は証明書未準備などで handshake が EOF / reset になる
-/// ことがある。成功した接続はすぐに閉じる (ready 判定専用)。
-async fn wait_for_tls_listener(host: &str, port: u16, ca_pem: &str, server_name: &str) {
-    let mut roots = RootCertStore::empty();
-    let ca = CertificateDer::from_pem_slice(ca_pem.as_bytes())
-        .expect("CA 証明書 PEM のパースに成功すること");
-    roots
-        .add(ca)
-        .expect("CA 証明書を RootCertStore に登録できること");
-    let connector = TlsConnector::from(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ));
-    let name = ServerName::try_from(server_name.to_string())
-        .expect("server_name が ServerName として妥当であること");
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(tcp) = TcpStream::connect((host, port)).await {
-            let _ = tcp.set_nodelay(true);
-            if connector.connect(name.clone(), tcp).await.is_ok() {
-                return;
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!("Mosquitto TLS がハンドシェイク可能になるまでのタイムアウト");
-        }
-        sleep(Duration::from_millis(100)).await;
     }
 }

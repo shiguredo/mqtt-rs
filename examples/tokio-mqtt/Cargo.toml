@@ -64,4 +64,4 @@ features = ["aws_lc_rs", "pem"]
 # Mosquitto コンテナを起動して MQTT over TCP / TLS の統合テストを行うために使用
 # macOS では Apple container、Linux では Docker Engine API を利用する
 [dev-dependencies.shiguredo_container]
-version = "2026.1.0-canary.0"
+version = "2026.1.0-canary.1"
