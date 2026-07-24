@@ -7,7 +7,8 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
@@ -23,12 +24,25 @@ use tokio::time::{Instant, sleep};
 /// `mosquitto version X.Y.Z running` にだけ現れる。
 const MOSQUITTO_RUNNING_LOG: &str = "running";
 
-/// `with_copy_to` はコンテナ起動後に走るため、投入完了を待つシェル。
+/// macOS 専用: `with_copy_to` が start 後に走るため、投入完了を待つシェル。
 ///
 /// イメージ同梱の `/mosquitto/config/mosquitto.conf` が既にあるため、
 /// conf の存在待ちだとコピー前に起動してしまう。同梱されない `server.key`
 /// の出現を完了合図にする。eclipse-mosquitto イメージ (Alpine) の `/bin/sh` を使う。
+/// Linux は start 前投入契約があるため、この待ちは不要。
+#[cfg(target_os = "macos")]
 const MOSQUITTO_WAIT_CONFIG_AND_EXEC: &str = "while [ ! -f /mosquitto/config/server.key ]; do sleep 0.05; done; exec mosquitto -c /mosquitto/config/mosquitto.conf";
+
+/// ホスト側の一時ディレクトリを一意な名前で作る。
+///
+/// 連続テストで衝突しないよう、プロセス ID とナノ秒を混ぜる。
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("システム時刻が UNIX epoch 以降であること")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
 
 /// EMQX Dashboard のフル起動判定 (`GET /status` が HTTP 200)。
 fn emqx_dashboard_ready() -> WaitFor {
@@ -145,50 +159,37 @@ impl Drop for MosquittoTlsGuard {
 ///
 /// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
 /// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
-/// 証明書と自前の `mosquitto.conf` を `with_copy_to` で投入する。
-/// クライアントは dangerous verifier ではなく、この CA を trust root として
-/// 正規に検証する。
+/// 証明書と自前の `mosquitto.conf` を `with_copy_to` のディレクトリ一括投入で
+/// `/mosquitto/config` へ置く。クライアントは dangerous verifier ではなく、
+/// この CA を trust root として正規に検証する。
 ///
-/// `with_copy_to` は起動後に走るため、CMD 側で設定ファイル出現を待ってから
-/// `mosquitto` を `exec` する。
+/// Linux は create 後・start 前に投入が完了するため、設定ファイルを直接指定して
+/// `mosquitto` を起動する。macOS は start 後投入のため、CMD 側で `server.key`
+/// の出現を待ってから `exec` する。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
-
-    // eclipse-mosquitto イメージの慣習に合わせ、設定と証明書を
-    // /mosquitto/config/ 配下へ配置する。
-    let conf_path = "/mosquitto/config/mosquitto.conf";
-    let ca_path = "/mosquitto/config/ca.pem";
-    let cert_path = "/mosquitto/config/server.pem";
-    let key_path = "/mosquitto/config/server.key";
-
-    // listener 8883 のみを公開する。平文 1883 は立てない。
-    // Mosquitto 2.x は既定で匿名接続を拒否するため allow_anonymous true が必要。
-    let mosquitto_conf = format!(
-        "listener 8883\n\
-         protocol mqtt\n\
-         cafile {ca_path}\n\
-         certfile {cert_path}\n\
-         keyfile {key_path}\n\
-         require_certificate false\n\
-         allow_anonymous true\n\
-         persistence false\n"
-    );
+    let host_config_dir = write_mosquitto_tls_config_dir(&generated);
 
     // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
+    // 既定 mode 0644 のままにする。0600 + root 所有だと権限降下後の
+    // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
     let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
+    let image = GenericImage::new("eclipse-mosquitto", tag)
         .with_exposed_port(8883.tcp())
         .with_wait_for(mosquitto_ready())
-        .with_cmd(["/bin/sh", "-c", MOSQUITTO_WAIT_CONFIG_AND_EXEC])
-        .with_copy_to(conf_path, mosquitto_conf.into_bytes())
-        .with_copy_to(ca_path, generated.ca_pem.clone().into_bytes())
-        .with_copy_to(cert_path, generated.server_cert_pem.into_bytes())
-        // 既定 0644 のままにする。0600 + root 所有だと権限降下後の
-        // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
-        .with_copy_to(key_path, generated.server_key_pem.into_bytes())
+        .with_copy_to("/mosquitto/config", host_config_dir.clone());
+
+    #[cfg(target_os = "linux")]
+    let image = image.with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]);
+    #[cfg(target_os = "macos")]
+    let image = image.with_cmd(["/bin/sh", "-c", MOSQUITTO_WAIT_CONFIG_AND_EXEC]);
+
+    let container = image
         .start()
         .await
         .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
+    // start 完了時点でコンテナへの投入は終わっているのでホスト側は不要。
+    let _ = std::fs::remove_dir_all(&host_config_dir);
 
     let host = container
         .get_host()
@@ -206,6 +207,51 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
         ca_pem: generated.ca_pem,
         server_name: generated.server_name,
     }
+}
+
+/// Mosquitto TLS 用の設定と証明書をホスト一時ディレクトリへ書き出す。
+///
+/// 戻り値のディレクトリを `with_copy_to("/mosquitto/config", ...)` に渡すと、
+/// 配下のファイルがコンテナの `/mosquitto/config/` に一括投入される。
+fn write_mosquitto_tls_config_dir(generated: &GeneratedCerts) -> PathBuf {
+    // conf 内で参照するコンテナ内パス。
+    let ca_path = "/mosquitto/config/ca.pem";
+    let cert_path = "/mosquitto/config/server.pem";
+    let key_path = "/mosquitto/config/server.key";
+
+    // listener 8883 のみを公開する。平文 1883 は立てない。
+    // Mosquitto 2.x は既定で匿名接続を拒否するため allow_anonymous true が必要。
+    let mosquitto_conf = format!(
+        "listener 8883\n\
+         protocol mqtt\n\
+         cafile {ca_path}\n\
+         certfile {cert_path}\n\
+         keyfile {key_path}\n\
+         require_certificate false\n\
+         allow_anonymous true\n\
+         persistence false\n"
+    );
+
+    let host_dir = unique_temp_dir("mqtt-rs-mosquitto-tls");
+    std::fs::create_dir_all(&host_dir)
+        .expect("Mosquitto TLS 設定用のホスト一時ディレクトリの作成に成功すること");
+    write_file(&host_dir.join("mosquitto.conf"), mosquitto_conf.as_bytes());
+    write_file(&host_dir.join("ca.pem"), generated.ca_pem.as_bytes());
+    write_file(
+        &host_dir.join("server.pem"),
+        generated.server_cert_pem.as_bytes(),
+    );
+    write_file(
+        &host_dir.join("server.key"),
+        generated.server_key_pem.as_bytes(),
+    );
+    host_dir
+}
+
+/// ホスト一時ファイルへバイト列を書き込む。
+fn write_file(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes)
+        .unwrap_or_else(|e| panic!("{} への書き込みに成功すること: {e}", path.display()));
 }
 
 /// EMQX コンテナの生存期間をテスト中に保つためのガード。
@@ -597,17 +643,17 @@ impl Drop for EmqxQuicGuard {
 ///
 /// EMQX 5 系の既定では QUIC リスナーは無効なため、環境変数で明示的に
 /// 有効化する。証明書はイメージ同梱の例示証明書ではなく、`rcgen` で
-/// 生成した自前の CA と server 証明書を `with_copy_to` で投入する。
-/// こうすることで、クライアント側は無検証 (dangerous verifier) ではなく、
-/// 正規にこの CA を trust root として検証できる。
+/// 生成した自前の CA と server 証明書を `with_copy_to` のディレクトリ一括投入で
+/// `/opt/emqx/etc/certs` へ置く。こうすることで、クライアント側は無検証
+/// (dangerous verifier) ではなく、正規にこの CA を trust root として検証できる。
 ///
 /// QUIC の既定ポートは 14567/udp、ALPN は `"mqtt"`（EMQX の quicer
 /// listener 実装で確定）。TCP 版 (`start_emqx`) と関数を分けているのは、
 /// QUIC 用の環境変数と UDP ポートの expose を明示的にすることで、意図
 /// しないテストで QUIC リスナーが立ち上がる副作用を避けるため。
 ///
-/// `with_copy_to` は起動直後・ready 待機前に走る。EMQX の listener 設定は
-/// 起動シーケンス後半のため、証明書は読み取り前に揃う。
+/// `with_copy_to` は Linux では start 前、macOS では start 直後・ready 待機前に走る。
+/// EMQX の listener 設定は起動シーケンス後半のため、証明書は読み取り前に揃う。
 pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // localhost 向けの CA と server 証明書を rcgen で生成する。
     let generated = generate_localhost_certs();
@@ -617,10 +663,9 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // /opt/emqx/etc/certs/ 配下に置き、環境変数側は WorkingDir 相対の
     // "etc/certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
     // 衝突しないように "quic-*.pem" とする。
-    let cert_container_path = "/opt/emqx/etc/certs/quic-cert.pem";
-    let key_container_path = "/opt/emqx/etc/certs/quic-key.pem";
     let cert_env_path = "etc/certs/quic-cert.pem";
     let key_env_path = "etc/certs/quic-key.pem";
+    let host_certs_dir = write_emqx_quic_certs_dir(&generated);
 
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(14567.udp())
@@ -642,11 +687,11 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
             "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
             key_env_path,
         )
-        .with_copy_to(cert_container_path, generated.server_cert_pem.into_bytes())
-        .with_copy_to(key_container_path, generated.server_key_pem.into_bytes())
+        .with_copy_to("/opt/emqx/etc/certs", host_certs_dir.clone())
         .start()
         .await
         .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
+    let _ = std::fs::remove_dir_all(&host_certs_dir);
 
     let host = container
         .get_host()
@@ -667,6 +712,24 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         ca_pem: generated.ca_pem,
         server_name: generated.server_name,
     }
+}
+
+/// EMQX QUIC 用の証明書をホスト一時ディレクトリへ書き出す。
+///
+/// 戻り値のディレクトリを `with_copy_to("/opt/emqx/etc/certs", ...)` に渡す。
+fn write_emqx_quic_certs_dir(generated: &GeneratedCerts) -> PathBuf {
+    let host_dir = unique_temp_dir("mqtt-rs-emqx-quic-certs");
+    std::fs::create_dir_all(&host_dir)
+        .expect("EMQX QUIC 証明書用のホスト一時ディレクトリの作成に成功すること");
+    write_file(
+        &host_dir.join("quic-cert.pem"),
+        generated.server_cert_pem.as_bytes(),
+    );
+    write_file(
+        &host_dir.join("quic-key.pem"),
+        generated.server_key_pem.as_bytes(),
+    );
+    host_dir
 }
 
 /// `start_emqx_quic` / `start_mosquitto_tls` 内部で使う証明書一式。

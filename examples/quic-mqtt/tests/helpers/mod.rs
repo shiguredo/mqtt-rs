@@ -7,13 +7,29 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use shiguredo_container::core::IntoContainerPort;
 use shiguredo_container::core::wait::HttpWaitStrategy;
 use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 
 use quic_mqtt::client::MqttClient;
+
+/// ホスト側の一時ディレクトリを一意な名前で作る。
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("システム時刻が UNIX epoch 以降であること")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+/// ホスト一時ファイルへバイト列を書き込む。
+fn write_file(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes)
+        .unwrap_or_else(|e| panic!("{} への書き込みに成功すること: {e}", path.display()));
+}
 
 /// EMQX Dashboard のフル起動判定 (`GET /status` が HTTP 200)。
 fn emqx_dashboard_ready() -> WaitFor {
@@ -76,15 +92,15 @@ impl Drop for EmqxQuicGuard {
 ///
 /// EMQX 5 系の既定では QUIC リスナーは無効なため、環境変数で明示的に
 /// 有効化する。証明書はイメージ同梱の例示証明書ではなく、`rcgen` で
-/// 生成した自前の CA と server 証明書を `with_copy_to` で投入する。
-/// こうすることで、クライアント側は無検証 (dangerous verifier) ではなく、
-/// 正規にこの CA を trust root として検証できる。
+/// 生成した自前の CA と server 証明書を `with_copy_to` のディレクトリ一括投入で
+/// `/opt/emqx/etc/certs` へ置く。こうすることで、クライアント側は無検証
+/// (dangerous verifier) ではなく、正規にこの CA を trust root として検証できる。
 ///
 /// QUIC の既定ポートは 14567/udp、ALPN は `"mqtt"`（EMQX の quicer
 /// listener 実装で確定）。
 ///
-/// `with_copy_to` は起動直後・ready 待機前に走る。EMQX の listener 設定は
-/// 起動シーケンス後半のため、証明書は読み取り前に揃う。
+/// `with_copy_to` は Linux では start 前、macOS では start 直後・ready 待機前に走る。
+/// EMQX の listener 設定は起動シーケンス後半のため、証明書は読み取り前に揃う。
 pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // localhost 向けの CA と server 証明書を rcgen で生成する。
     let generated = generate_localhost_certs();
@@ -94,10 +110,9 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // /opt/emqx/etc/certs/ 配下に置き、環境変数側は WorkingDir 相対の
     // "etc/certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
     // 衝突しないように "quic-*.pem" とする。
-    let cert_container_path = "/opt/emqx/etc/certs/quic-cert.pem";
-    let key_container_path = "/opt/emqx/etc/certs/quic-key.pem";
     let cert_env_path = "etc/certs/quic-cert.pem";
     let key_env_path = "etc/certs/quic-key.pem";
+    let host_certs_dir = write_emqx_quic_certs_dir(&generated);
 
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(14567.udp())
@@ -119,11 +134,11 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
             "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
             key_env_path,
         )
-        .with_copy_to(cert_container_path, generated.server_cert_pem.into_bytes())
-        .with_copy_to(key_container_path, generated.server_key_pem.into_bytes())
+        .with_copy_to("/opt/emqx/etc/certs", host_certs_dir.clone())
         .start()
         .await
         .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
+    let _ = std::fs::remove_dir_all(&host_certs_dir);
 
     let host = container
         .get_host()
@@ -144,6 +159,22 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
         ca_pem: generated.ca_pem,
         server_name: generated.server_name,
     }
+}
+
+/// EMQX QUIC 用の証明書をホスト一時ディレクトリへ書き出す。
+fn write_emqx_quic_certs_dir(generated: &GeneratedCerts) -> PathBuf {
+    let host_dir = unique_temp_dir("mqtt-rs-quic-emqx-certs");
+    std::fs::create_dir_all(&host_dir)
+        .expect("EMQX QUIC 証明書用のホスト一時ディレクトリの作成に成功すること");
+    write_file(
+        &host_dir.join("quic-cert.pem"),
+        generated.server_cert_pem.as_bytes(),
+    );
+    write_file(
+        &host_dir.join("quic-key.pem"),
+        generated.server_key_pem.as_bytes(),
+    );
+    host_dir
 }
 
 /// EMQX QUIC に接続し、MQTT CONNECT まで完了したクライアントを返す。
