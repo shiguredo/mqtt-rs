@@ -28,7 +28,7 @@ description: 時雨堂の依存 0・no_std・Sans I/O MQTT クライアントラ
 - crate 名: `shiguredo_mqtt`
 - バージョン: 2026.1.0-canary.0
 - Rust Edition: 2024
-- 最小 Rust バージョン: 1.88
+- 最小 Rust バージョン: 1.93
 - ライセンス: Apache-2.0
 - 外部依存: なし
 - `no_std`: 対応。ただし `alloc` は使用する。

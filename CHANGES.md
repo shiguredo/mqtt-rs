@@ -10,3 +10,6 @@
   - バグ修正
 
 ## develop
+
+- [CHANGE] MSRV (rust-version) を 1.88 から 1.93 に上げる
+  - @voluntas
