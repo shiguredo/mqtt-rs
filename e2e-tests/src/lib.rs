@@ -6,7 +6,7 @@
 //! Mosquitto は平文 TCP に加え、mqtts (TCP + TLS / tokio-rustls) の smoke test も行う。
 //! EMQX は平文 TCP と MQTT over QUIC の smoke test を行う。
 //!
-//! Docker が必要。実行は `RUST_TEST_THREADS=1 cargo test -p e2e-tests`。
+//! コンテナランタイムが必要。実行は `RUST_TEST_THREADS=1 cargo test -p e2e-tests`。
 //! 既定の workspace test からは `--exclude e2e-tests` で除外する。
 
 pub mod client;

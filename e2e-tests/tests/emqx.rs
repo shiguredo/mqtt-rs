@@ -1,6 +1,5 @@
 //! EMQX ブローカーに対する接続 smoke test。
 //!
-//! testcontainers-modules に EMQX 用モジュールが存在しないため、
 //! `helpers::start_emqx` / `helpers::start_emqx_quic` が `GenericImage` から
 //! `emqx/emqx` イメージを直接起動する。ここでは MQTT v3.1.1 / v5.0 それぞれで
 //! CONNECT → CONNACK → DISCONNECT の疎通のみを確認する。
@@ -115,7 +114,7 @@ async fn emqx_v5_connect_smoke_quic() {
         .start()
         .expect("s2n-quic Client の起動に成功すること");
 
-    // testcontainers が返す host はホスト名または IP。Client の IO は
+    // shiguredo_container が返す host はホスト名または IP。Client の IO は
     // 0.0.0.0:0 で IPv4 のみを bind するため、IPv6 のアドレスに接続しようと
     // すると失敗する。macOS では localhost の解決が ::1 を優先する場合が
     // あるため、IPv4 のアドレスだけを抽出する。

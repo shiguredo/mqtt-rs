@@ -4,7 +4,7 @@
 //! 注入した Mosquitto を 8883 で起動する。クライアントは `MqttClient::connect_tls`
 //! 経由で接続し、CA を trust root として正規にサーバー証明書を検証する。
 //!
-//! Docker が必要なため、既定の workspace test からは除外する (CODEBASE.md)。
+//! コンテナランタイムが必要なため、既定の workspace test からは除外する (CODEBASE.md)。
 
 mod helpers;
 

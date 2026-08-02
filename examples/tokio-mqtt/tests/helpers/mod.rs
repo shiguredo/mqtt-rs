@@ -7,32 +7,64 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
-};
-use testcontainers_modules::mosquitto;
-use testcontainers_modules::testcontainers::core::{CopyDataSource, IntoContainerPort, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep};
+use shiguredo_container::core::IntoContainerPort;
+use shiguredo_container::core::mounts::Mount;
+use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 
 use tokio_mqtt::client::MqttClient;
 
+/// Mosquitto が listener 受付可能になったことを示すログ断片。
+///
+/// `mosquitto version X.Y.Z starting` には含まれず、
+/// `mosquitto version X.Y.Z running` にだけ現れる。
+const MOSQUITTO_RUNNING_LOG: &str = "running";
+
+/// ホスト側の一時ディレクトリを一意な名前で作る。
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("システム時刻が UNIX epoch 以降であること")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+/// Mosquitto の listener 受付可能判定 (ログに `running` が出るまで)。
+fn mosquitto_ready() -> WaitFor {
+    WaitFor::message_on_either_std(MOSQUITTO_RUNNING_LOG)
+}
+
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
-/// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある。
+/// `container` フィールドは Drop 時のコンテナ削除のために保持する必要がある。
 pub struct MosquittoGuard {
-    pub container: ContainerAsync<mosquitto::Mosquitto>,
+    container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
     pub port: u16,
 }
 
+impl Drop for MosquittoGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let _ = container.rm_blocking();
+        }
+    }
+}
+
 /// Mosquitto コンテナを起動し、生存期間を保ちながら (host, port) を返す。
+///
+/// 平文 listener (1883) のみ。匿名接続を許可する `/mosquitto-no-auth.conf` を使う。
+/// イメージタグは CI 再現性のため固定する。
+///
+/// ready は `WaitFor` でログの `running` を待つ。
 pub async fn start_mosquitto() -> MosquittoGuard {
-    let container = mosquitto::Mosquitto::default()
+    let tag = "2.0.18";
+    let container = GenericImage::new("eclipse-mosquitto", tag)
+        .with_exposed_port(1883.tcp())
+        .with_wait_for(mosquitto_ready())
+        .with_cmd(["mosquitto", "-c", "/mosquitto-no-auth.conf"])
         .start()
         .await
         .expect("Mosquitto コンテナの起動に成功すること");
@@ -42,13 +74,11 @@ pub async fn start_mosquitto() -> MosquittoGuard {
         .expect("コンテナのホスト名の取得に成功すること")
         .to_string();
     let port = container
-        .get_host_port_ipv4(1883)
+        .get_host_port_ipv4(1883.tcp())
         .await
         .expect("コンテナの 1883 ポート番号の取得に成功すること");
-    // TCP レベルで待ち受けが始まるまでポーリングで待つ。
-    wait_for_broker(&host, port, "Mosquitto").await;
     MosquittoGuard {
-        container,
+        container: Some(container),
         host,
         port,
     }
@@ -59,7 +89,7 @@ pub async fn start_mosquitto() -> MosquittoGuard {
 /// `ca_pem` はクライアント側の rustls RootCertStore に渡す CA 証明書 (PEM)。
 /// `server_name` はサーバー証明書の SAN/CN であり、TLS ハンドシェイクの SNI に使う。
 pub struct MosquittoTlsGuard {
-    pub container: ContainerAsync<GenericImage>,
+    container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
     /// ホスト側にマップされた 8883/tcp ポート。
     pub port: u16,
@@ -67,25 +97,73 @@ pub struct MosquittoTlsGuard {
     pub server_name: String,
 }
 
+impl Drop for MosquittoTlsGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            let _ = container.rm_blocking();
+        }
+    }
+}
+
 /// TLS listener (8883) を有効化した Mosquitto コンテナを起動する。
 ///
-/// `testcontainers_modules::mosquitto` は平文専用の `/mosquitto-no-auth.conf` を
-/// 使うため、TLS 用には同じイメージ (`eclipse-mosquitto:2.0.18`) を
-/// `GenericImage` で起動し、rcgen で生成した証明書と自前の `mosquitto.conf` を
-/// 注入する。クライアントは dangerous verifier ではなく、この CA を trust root
-/// として正規に検証する。
+/// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
+/// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
+/// 証明書と自前の `mosquitto.conf` を `Mount::bind_mount` でホスト一時ディレクトリから
+/// `/mosquitto/config` へマウントする。クライアントは dangerous verifier ではなく、
+/// この CA を trust root として正規に検証する。
+///
+/// macOS は `with_copy_to` が start 後に走るため投入完了待ちのシェルが必要だったが、
+/// `Mount::bind_mount` は start 前にマウントが完了するため、macOS / Linux どちらでも
+/// 設定ファイルを直接参照して `mosquitto` を起動できる。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
+    let host_config_dir = write_mosquitto_tls_config_dir(&generated);
 
-    // eclipse-mosquitto イメージの慣習に合わせ、設定と証明書を
-    // /mosquitto/config/ 配下へ配置する。
-    let conf_path = "/mosquitto/config/mosquitto.conf";
+    // 平文 Mosquitto と同じタグに固定し、CI の再現性を保つ。
+    // 既定 mode 0644 のままにする。0600 + root 所有だと権限降下後の
+    // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
+    let tag = "2.0.18";
+    let host_config_dir_str = host_config_dir
+        .to_str()
+        .expect("Mosquitto TLS 設定ディレクトリのパスが UTF-8 であること")
+        .to_string();
+    let container = GenericImage::new("eclipse-mosquitto", tag)
+        .with_exposed_port(8883.tcp())
+        .with_wait_for(mosquitto_ready())
+        .with_mount(Mount::bind_mount(host_config_dir_str, "/mosquitto/config"))
+        .with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"])
+        .start()
+        .await
+        .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
+    // マウントは start 前に完了するため、ホスト側ディレクトリはこの時点で不要。
+    let _ = std::fs::remove_dir_all(&host_config_dir);
+
+    let host = container
+        .get_host()
+        .await
+        .expect("コンテナのホスト名の取得に成功すること")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(8883.tcp())
+        .await
+        .expect("コンテナの 8883 ポート番号の取得に成功すること");
+    MosquittoTlsGuard {
+        container: Some(container),
+        host,
+        port,
+        ca_pem: generated.ca_pem,
+        server_name: generated.server_name,
+    }
+}
+
+/// Mosquitto TLS 用の設定と証明書をホスト一時ディレクトリへ書き出す。
+fn write_mosquitto_tls_config_dir(generated: &GeneratedCerts) -> PathBuf {
+    // conf 内で参照するコンテナ内パス。
     let ca_path = "/mosquitto/config/ca.pem";
     let cert_path = "/mosquitto/config/server.pem";
     let key_path = "/mosquitto/config/server.key";
 
-    // listener 8883 のみを公開する。平文 1883 は立てない。
-    // Mosquitto 2.x は既定で匿名接続を拒否するため allow_anonymous true が必要。
     let mosquitto_conf = format!(
         "listener 8883\n\
          protocol mqtt\n\
@@ -97,49 +175,26 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
          persistence false\n"
     );
 
-    // testcontainers_modules::mosquitto と同じタグに固定し、CI の再現性を保つ。
-    let tag = "2.0.18";
-    let container = GenericImage::new("eclipse-mosquitto", tag)
-        .with_exposed_port(8883.tcp())
-        .with_wait_for(WaitFor::message_on_stderr(format!(
-            "mosquitto version {tag} running"
-        )))
-        .with_cmd(["mosquitto", "-c", conf_path])
-        .with_copy_to(conf_path, CopyDataSource::Data(mosquitto_conf.into_bytes()))
-        .with_copy_to(
-            ca_path,
-            CopyDataSource::Data(generated.ca_pem.clone().into_bytes()),
-        )
-        .with_copy_to(
-            cert_path,
-            CopyDataSource::Data(generated.server_cert_pem.into_bytes()),
-        )
-        .with_copy_to(
-            key_path,
-            CopyDataSource::Data(generated.server_key_pem.into_bytes()),
-        )
-        .start()
-        .await
-        .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
+    let host_dir = unique_temp_dir("mqtt-rs-tokio-mosquitto-tls");
+    std::fs::create_dir_all(&host_dir)
+        .expect("Mosquitto TLS 設定用のホスト一時ディレクトリの作成に成功すること");
+    write_file(&host_dir.join("mosquitto.conf"), mosquitto_conf.as_bytes());
+    write_file(&host_dir.join("ca.pem"), generated.ca_pem.as_bytes());
+    write_file(
+        &host_dir.join("server.pem"),
+        generated.server_cert_pem.as_bytes(),
+    );
+    write_file(
+        &host_dir.join("server.key"),
+        generated.server_key_pem.as_bytes(),
+    );
+    host_dir
+}
 
-    let host = container
-        .get_host()
-        .await
-        .expect("コンテナのホスト名の取得に成功すること")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(8883)
-        .await
-        .expect("コンテナの 8883 ポート番号の取得に成功すること");
-    // TLS ハンドシェイク前でも TCP accept は可能なので、平文と同様にポーリングする。
-    wait_for_broker(&host, port, "Mosquitto TLS").await;
-    MosquittoTlsGuard {
-        container,
-        host,
-        port,
-        ca_pem: generated.ca_pem,
-        server_name: generated.server_name,
-    }
+/// ホスト一時ファイルへバイト列を書き込む。
+fn write_file(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes)
+        .unwrap_or_else(|e| panic!("{} への書き込みに成功すること: {e}", path.display()));
 }
 
 /// Mosquitto に TCP 接続し、MQTT CONNECT まで完了したクライアントを返す。
@@ -191,6 +246,11 @@ struct GeneratedCerts {
 /// `rcgen` で「自己署名 CA + それが署名した localhost 向けサーバー証明書」を
 /// 生成する。テストの都度新しく作るのでネットワークや状態への副作用は無い。
 fn generate_localhost_certs() -> GeneratedCerts {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa,
+        KeyPair,
+    };
+
     // CA (Certificate Authority) を生成する。
     let mut ca_params = CertificateParams::new(Vec::<String>::new())
         .expect("CA 用 CertificateParams の作成に成功すること");
@@ -221,20 +281,5 @@ fn generate_localhost_certs() -> GeneratedCerts {
         server_cert_pem: server_cert.pem(),
         server_key_pem: server_key.serialize_pem(),
         server_name,
-    }
-}
-
-/// ブローカーが指定ポートで接続を受け付けるまでポーリングで待つ。
-async fn wait_for_broker(host: &str, port: u16, service_name: &str) {
-    let addr = format!("{host}:{port}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("{service_name} が {port} ポートで待ち受けるまでのタイムアウト");
-        }
-        sleep(Duration::from_millis(100)).await;
     }
 }

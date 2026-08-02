@@ -1,6 +1,6 @@
 //! EMQX の MQTT over QUIC に対する接続テスト。
 //!
-//! Docker が必要なため、既定の workspace test からは除外する (CODEBASE.md)。
+//! コンテナランタイムが必要なため、既定の workspace test からは除外する (CODEBASE.md)。
 
 mod helpers;
 
