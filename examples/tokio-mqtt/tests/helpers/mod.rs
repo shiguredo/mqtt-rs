@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shiguredo_container::core::IntoContainerPort;
+use shiguredo_container::core::mounts::Mount;
 use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 
 use tokio_mqtt::client::MqttClient;
@@ -20,15 +21,6 @@ use tokio_mqtt::client::MqttClient;
 /// `mosquitto version X.Y.Z starting` には含まれず、
 /// `mosquitto version X.Y.Z running` にだけ現れる。
 const MOSQUITTO_RUNNING_LOG: &str = "running";
-
-/// macOS 専用: `with_copy_to` が start 後に走るため、投入完了を待つシェル。
-///
-/// イメージ同梱の `/mosquitto/config/mosquitto.conf` が既にあるため、
-/// conf の存在待ちだとコピー前に起動してしまう。同梱されない `server.key`
-/// の出現を完了合図にする。eclipse-mosquitto イメージ (Alpine) の `/bin/sh` を使う。
-/// Linux は start 前投入契約があるため、この待ちは不要。
-#[cfg(target_os = "macos")]
-const MOSQUITTO_WAIT_CONFIG_AND_EXEC: &str = "while [ ! -f /mosquitto/config/server.key ]; do sleep 0.05; done; exec mosquitto -c /mosquitto/config/mosquitto.conf";
 
 /// ホスト側の一時ディレクトリを一意な名前で作る。
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -44,31 +36,9 @@ fn mosquitto_ready() -> WaitFor {
     WaitFor::message_on_either_std(MOSQUITTO_RUNNING_LOG)
 }
 
-/// コンテナランタイム向けに、指定 ID のコンテナを同期的に削除する。
-///
-/// `ContainerAsync` の Drop は tokio Runtime 内だと削除スレッドを join しないため、
-/// 連続 E2E で孤立コンテナが溜まり得る。ガードの Drop から明示的に掃除する。
-fn force_remove_container(id: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("container")
-            .args(["stop", id])
-            .output();
-        let _ = std::process::Command::new("container")
-            .args(["rm", id])
-            .output();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .output();
-    }
-}
-
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
-/// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある。
+/// `container` フィールドは Drop 時のコンテナ削除のために保持する必要がある。
 pub struct MosquittoGuard {
     container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
@@ -78,9 +48,7 @@ pub struct MosquittoGuard {
 impl Drop for MosquittoGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -132,9 +100,7 @@ pub struct MosquittoTlsGuard {
 impl Drop for MosquittoTlsGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -143,13 +109,13 @@ impl Drop for MosquittoTlsGuard {
 ///
 /// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
 /// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
-/// 証明書と自前の `mosquitto.conf` を `with_copy_to` のディレクトリ一括投入で
-/// `/mosquitto/config` へ置く。クライアントは dangerous verifier ではなく、
+/// 証明書と自前の `mosquitto.conf` を `Mount::bind_mount` でホスト一時ディレクトリから
+/// `/mosquitto/config` へマウントする。クライアントは dangerous verifier ではなく、
 /// この CA を trust root として正規に検証する。
 ///
-/// Linux は create 後・start 前に投入が完了するため、設定ファイルを直接指定して
-/// `mosquitto` を起動する。macOS は start 後投入のため、CMD 側で `server.key`
-/// の出現を待ってから `exec` する。
+/// macOS は `with_copy_to` が start 後に走るため投入完了待ちのシェルが必要だったが、
+/// `Mount::bind_mount` は start 前にマウントが完了するため、macOS / Linux どちらでも
+/// 設定ファイルを直接参照して `mosquitto` を起動できる。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
     let host_config_dir = write_mosquitto_tls_config_dir(&generated);
@@ -158,20 +124,19 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     // 既定 mode 0644 のままにする。0600 + root 所有だと権限降下後の
     // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
     let tag = "2.0.18";
-    let image = GenericImage::new("eclipse-mosquitto", tag)
+    let host_config_dir_str = host_config_dir
+        .to_str()
+        .expect("Mosquitto TLS 設定ディレクトリのパスが UTF-8 であること")
+        .to_string();
+    let container = GenericImage::new("eclipse-mosquitto", tag)
         .with_exposed_port(8883.tcp())
         .with_wait_for(mosquitto_ready())
-        .with_copy_to("/mosquitto/config", host_config_dir.clone());
-
-    #[cfg(target_os = "linux")]
-    let image = image.with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]);
-    #[cfg(target_os = "macos")]
-    let image = image.with_cmd(["/bin/sh", "-c", MOSQUITTO_WAIT_CONFIG_AND_EXEC]);
-
-    let container = image
+        .with_mount(Mount::bind_mount(host_config_dir_str, "/mosquitto/config"))
+        .with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"])
         .start()
         .await
         .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
+    // マウントは start 前に完了するため、ホスト側ディレクトリはこの時点で不要。
     let _ = std::fs::remove_dir_all(&host_config_dir);
 
     let host = container

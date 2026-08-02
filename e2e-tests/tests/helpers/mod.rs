@@ -14,6 +14,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, IsCa, KeyPair,
 };
 use shiguredo_container::core::IntoContainerPort;
+use shiguredo_container::core::mounts::Mount;
 use shiguredo_container::core::wait::HttpWaitStrategy;
 use shiguredo_container::{AsyncRunner, ContainerAsync, GenericImage, ImageExt, WaitFor};
 use tokio::time::{Instant, sleep};
@@ -23,15 +24,6 @@ use tokio::time::{Instant, sleep};
 /// `mosquitto version X.Y.Z starting` には含まれず、
 /// `mosquitto version X.Y.Z running` にだけ現れる。
 const MOSQUITTO_RUNNING_LOG: &str = "running";
-
-/// macOS 専用: `with_copy_to` が start 後に走るため、投入完了を待つシェル。
-///
-/// イメージ同梱の `/mosquitto/config/mosquitto.conf` が既にあるため、
-/// conf の存在待ちだとコピー前に起動してしまう。同梱されない `server.key`
-/// の出現を完了合図にする。eclipse-mosquitto イメージ (Alpine) の `/bin/sh` を使う。
-/// Linux は start 前投入契約があるため、この待ちは不要。
-#[cfg(target_os = "macos")]
-const MOSQUITTO_WAIT_CONFIG_AND_EXEC: &str = "while [ ! -f /mosquitto/config/server.key ]; do sleep 0.05; done; exec mosquitto -c /mosquitto/config/mosquitto.conf";
 
 /// ホスト側の一時ディレクトリを一意な名前で作る。
 ///
@@ -58,31 +50,11 @@ fn mosquitto_ready() -> WaitFor {
     WaitFor::message_on_either_std(MOSQUITTO_RUNNING_LOG)
 }
 
-/// コンテナランタイム向けに、指定 ID のコンテナを同期的に削除する。
-///
-/// `ContainerAsync` の Drop は tokio Runtime 内だと削除スレッドを join しないため、
-/// 連続 E2E で孤立コンテナが溜まり得る。ガードの Drop から明示的に掃除する。
-fn force_remove_container(id: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("container")
-            .args(["stop", id])
-            .output();
-        let _ = std::process::Command::new("container")
-            .args(["rm", id])
-            .output();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .output();
-    }
-}
-
 /// Mosquitto コンテナの生存期間をテスト中に保つためのガード。
 ///
-/// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある。
+/// `container` フィールドは Drop 時のコンテナ削除のために保持する必要がある。
+/// `rm_blocking` は `Drop` 内の同期コンテキストからでも削除完了を待てるため、
+/// 外部 CLI に頼らずライブラリの公開 API だけで掃除できる。
 /// モジュール冒頭の `#![allow(dead_code)]` により、参照されないことによる
 /// warning は抑制される。
 pub struct MosquittoGuard {
@@ -94,9 +66,7 @@ pub struct MosquittoGuard {
 impl Drop for MosquittoGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -148,9 +118,7 @@ pub struct MosquittoTlsGuard {
 impl Drop for MosquittoTlsGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -159,13 +127,13 @@ impl Drop for MosquittoTlsGuard {
 ///
 /// 平文用の `/mosquitto-no-auth.conf` では足りないため、同じイメージ
 /// (`eclipse-mosquitto:2.0.18`) を `GenericImage` で起動し、rcgen で生成した
-/// 証明書と自前の `mosquitto.conf` を `with_copy_to` のディレクトリ一括投入で
-/// `/mosquitto/config` へ置く。クライアントは dangerous verifier ではなく、
+/// 証明書と自前の `mosquitto.conf` を `Mount::bind_mount` でホスト一時ディレクトリから
+/// `/mosquitto/config` へマウントする。クライアントは dangerous verifier ではなく、
 /// この CA を trust root として正規に検証する。
 ///
-/// Linux は create 後・start 前に投入が完了するため、設定ファイルを直接指定して
-/// `mosquitto` を起動する。macOS は start 後投入のため、CMD 側で `server.key`
-/// の出現を待ってから `exec` する。
+/// macOS は `with_copy_to` が start 後に走るため投入完了待ちのシェルが必要だったが、
+/// `Mount::bind_mount` は start 前にマウントが完了するため、macOS / Linux どちらでも
+/// 設定ファイルを直接参照して `mosquitto` を起動できる。
 pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     let generated = generate_localhost_certs();
     let host_config_dir = write_mosquitto_tls_config_dir(&generated);
@@ -174,21 +142,19 @@ pub async fn start_mosquitto_tls() -> MosquittoTlsGuard {
     // 既定 mode 0644 のままにする。0600 + root 所有だと権限降下後の
     // mosquitto ユーザーが鍵を読めず TLS が立ち上がらない。
     let tag = "2.0.18";
-    let image = GenericImage::new("eclipse-mosquitto", tag)
+    let host_config_dir_str = host_config_dir
+        .to_str()
+        .expect("Mosquitto TLS 設定ディレクトリのパスが UTF-8 であること")
+        .to_string();
+    let container = GenericImage::new("eclipse-mosquitto", tag)
         .with_exposed_port(8883.tcp())
         .with_wait_for(mosquitto_ready())
-        .with_copy_to("/mosquitto/config", host_config_dir.clone());
-
-    #[cfg(target_os = "linux")]
-    let image = image.with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]);
-    #[cfg(target_os = "macos")]
-    let image = image.with_cmd(["/bin/sh", "-c", MOSQUITTO_WAIT_CONFIG_AND_EXEC]);
-
-    let container = image
+        .with_mount(Mount::bind_mount(host_config_dir_str, "/mosquitto/config"))
+        .with_cmd(["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"])
         .start()
         .await
         .expect("TLS 有効の Mosquitto コンテナの起動に成功すること");
-    // start 完了時点でコンテナへの投入は終わっているのでホスト側は不要。
+    // マウントは start 前に完了するため、ホスト側ディレクトリはこの時点で不要。
     let _ = std::fs::remove_dir_all(&host_config_dir);
 
     let host = container
@@ -256,7 +222,7 @@ fn write_file(path: &Path, bytes: &[u8]) {
 
 /// EMQX コンテナの生存期間をテスト中に保つためのガード。
 ///
-/// `container` フィールドは Drop 時のコンテナ停止のために保持する必要がある
+/// `container` フィールドは Drop 時のコンテナ削除のために保持する必要がある
 /// （利用者からは参照しないが、モジュール冒頭の `#![allow(dead_code)]` により
 /// warning は抑制される）。
 pub struct EmqxGuard {
@@ -268,9 +234,7 @@ pub struct EmqxGuard {
 impl Drop for EmqxGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -278,7 +242,7 @@ impl Drop for EmqxGuard {
 /// SCRAM-SHA-256 Enhanced Authentication 用 EMQX コンテナのガード。
 ///
 /// Dashboard (18083) 経由で SCRAM authenticator とテストユーザーを注入する。
-/// `container` は Drop 時の停止のために保持する。
+/// `container` は Drop 時の削除のために保持する。
 pub struct EmqxScramGuard {
     container: Option<ContainerAsync<GenericImage>>,
     pub host: String,
@@ -295,9 +259,7 @@ pub struct EmqxScramGuard {
 impl Drop for EmqxScramGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
         }
     }
 }
@@ -622,6 +584,8 @@ pub async fn start_emqx() -> EmqxGuard {
 /// rustls provider の `with_certificate(&str)` にそのまま渡せる形式。
 pub struct EmqxQuicGuard {
     container: Option<ContainerAsync<GenericImage>>,
+    /// bind_mount でマウント中のホスト一時ディレクトリ。コンテナ削除後に掃除する。
+    host_certs_dir: Option<PathBuf>,
     pub host: String,
     pub udp_port: u16,
     pub ca_pem: String,
@@ -632,9 +596,10 @@ pub struct EmqxQuicGuard {
 impl Drop for EmqxQuicGuard {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let id = container.id().to_string();
-            drop(container);
-            force_remove_container(&id);
+            let _ = container.rm_blocking();
+        }
+        if let Some(dir) = self.host_certs_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -643,29 +608,36 @@ impl Drop for EmqxQuicGuard {
 ///
 /// EMQX 5 系の既定では QUIC リスナーは無効なため、環境変数で明示的に
 /// 有効化する。証明書はイメージ同梱の例示証明書ではなく、`rcgen` で
-/// 生成した自前の CA と server 証明書を `with_copy_to` のディレクトリ一括投入で
-/// `/opt/emqx/etc/certs` へ置く。こうすることで、クライアント側は無検証
-/// (dangerous verifier) ではなく、正規にこの CA を trust root として検証できる。
+/// 生成した自前の CA と server 証明書を `Mount::bind_mount` でホスト一時
+/// ディレクトリから `/opt/emqx/etc/quic-certs` へマウントする。こうすることで、
+/// クライアント側は無検証 (dangerous verifier) ではなく、正規にこの CA を
+/// trust root として検証できる。
 ///
 /// QUIC の既定ポートは 14567/udp、ALPN は `"mqtt"`（EMQX の quicer
 /// listener 実装で確定）。TCP 版 (`start_emqx`) と関数を分けているのは、
 /// QUIC 用の環境変数と UDP ポートの expose を明示的にすることで、意図
 /// しないテストで QUIC リスナーが立ち上がる副作用を避けるため。
 ///
-/// `with_copy_to` は Linux では start 前、macOS では start 直後・ready 待機前に走る。
-/// EMQX の listener 設定は起動シーケンス後半のため、証明書は読み取り前に揃う。
+/// macOS は `with_copy_to` が start 後に走るため、EMQX の QUIC listener
+/// 起動時に証明書が揃わないことがある。`Mount::bind_mount` は start 前に
+/// マウントが完了するため、macOS / Linux どちらでも証明書を読み取れる。
+/// マウント先は同梱の `certs/` (cert.pem / key.pem / cacert.pem) を隠さない
+/// よう専用ディレクトリ `quic-certs/` を新設する。
 pub async fn start_emqx_quic() -> EmqxQuicGuard {
     // localhost 向けの CA と server 証明書を rcgen で生成する。
     let generated = generate_localhost_certs();
 
     // コンテナ内で EMQX が読み取れる場所に証明書を配置する。EMQX の
-    // WorkingDir は /opt/emqx なので、同梱の例示証明書と同じ
-    // /opt/emqx/etc/certs/ 配下に置き、環境変数側は WorkingDir 相対の
-    // "etc/certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
+    // WorkingDir は /opt/emqx なので、環境変数側は WorkingDir 相対の
+    // "etc/quic-certs/..." で指定する。ファイル名は同梱の cert.pem / key.pem と
     // 衝突しないように "quic-*.pem" とする。
-    let cert_env_path = "etc/certs/quic-cert.pem";
-    let key_env_path = "etc/certs/quic-key.pem";
+    let cert_env_path = "etc/quic-certs/quic-cert.pem";
+    let key_env_path = "etc/quic-certs/quic-key.pem";
     let host_certs_dir = write_emqx_quic_certs_dir(&generated);
+    let host_certs_dir_str = host_certs_dir
+        .to_str()
+        .expect("EMQX QUIC 証明書ディレクトリのパスが UTF-8 であること")
+        .to_string();
 
     let container = GenericImage::new("emqx/emqx", "5.8.8")
         .with_exposed_port(14567.udp())
@@ -687,11 +659,13 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
             "EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE",
             key_env_path,
         )
-        .with_copy_to("/opt/emqx/etc/certs", host_certs_dir.clone())
+        .with_mount(Mount::bind_mount(
+            host_certs_dir_str,
+            "/opt/emqx/etc/quic-certs",
+        ))
         .start()
         .await
         .expect("QUIC 有効の EMQX コンテナの起動に成功すること");
-    let _ = std::fs::remove_dir_all(&host_certs_dir);
 
     let host = container
         .get_host()
@@ -707,6 +681,7 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
 
     EmqxQuicGuard {
         container: Some(container),
+        host_certs_dir: Some(host_certs_dir),
         host,
         udp_port,
         ca_pem: generated.ca_pem,
@@ -716,7 +691,7 @@ pub async fn start_emqx_quic() -> EmqxQuicGuard {
 
 /// EMQX QUIC 用の証明書をホスト一時ディレクトリへ書き出す。
 ///
-/// 戻り値のディレクトリを `with_copy_to("/opt/emqx/etc/certs", ...)` に渡す。
+/// 戻り値のディレクトリを `Mount::bind_mount` のホスト側に渡す。
 fn write_emqx_quic_certs_dir(generated: &GeneratedCerts) -> PathBuf {
     let host_dir = unique_temp_dir("mqtt-rs-emqx-quic-certs");
     std::fs::create_dir_all(&host_dir)
