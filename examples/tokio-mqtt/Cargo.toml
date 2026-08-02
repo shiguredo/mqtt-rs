@@ -2,7 +2,7 @@
 name = "tokio-mqtt"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.93"
 description = "Tokio-based MQTT client example"
 license = "Apache-2.0"
 publish = false
@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 複数キーを持つ依存はインラインテーブルではなくテーブルセクションで記述する。
 # tombi は行長超過のインラインテーブルを複数行に展開するが、複数行インラインテーブルは
-# TOML 1.1 の機能であり MSRV (cargo 1.88) ではマニフェストを解析できない。
+# TOML 1.1 の機能であり MSRV (cargo 1.93) ではマニフェストを解析できない。
 
 # MQTT over TLS (mqtts) 用 TLS 実装
 # 暗号バックエンドは aws-lc-rs に揃え、ring を持ち込まない
