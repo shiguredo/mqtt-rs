@@ -61,7 +61,7 @@ features = ["provider-address-token-default", "provider-tls-rustls"]
 # macOS では Apple container、Linux では Docker Engine API を利用する
 # http_wait_plain: EMQX Dashboard の WaitFor::http に必要
 [dependencies.shiguredo_container]
-version = "2026.1.0-canary.5"
+version = "2026.1.0-canary.8"
 features = ["http_wait_plain"]
 
 # MQTT over TLS (mqtts) の E2E smoke test 用 tokio ↔ rustls ブリッジ
