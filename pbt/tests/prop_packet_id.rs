@@ -1,40 +1,53 @@
 //! PacketIdManager のプロパティベーステスト。
 
-use proptest::prelude::*;
 use shiguredo_mqtt::state::packet_id::PacketIdManager;
 
-proptest! {
-    /// 割り当てた識別子はすべて一意であり、解放後に再利用される。
-    /// 各操作後に in_use_count がモデル集合の大きさと一致することも検証する。
-    #[test]
-    fn packet_id_uniqueness(ops in proptest::collection::vec(
-        (0u8..=1u8, any::<u16>()), 0..200
-    )) {
+/// 割り当てた識別子はすべて一意であり、解放後に再利用される。
+/// 各操作後に in_use_count がモデル集合の大きさと一致することも検証する。
+#[test]
+fn packet_id_uniqueness() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let ops_len = noprop::sample_usize_in(ctx, 0..=200);
         let mut manager = PacketIdManager::new();
         let mut allocated = std::collections::BTreeSet::new();
 
-        for (op, seed) in &ops {
-            if *op == 0 {
+        for _ in 0..ops_len {
+            let op = noprop::sample_bool(ctx);
+            let seed_value = noprop::sample_u16(ctx);
+            if !op {
                 if let Some(id) = manager.allocate() {
-                    prop_assert!(allocated.insert(id), "重複したパケット識別子が割り当てられた");
+                    assert!(
+                        allocated.insert(id),
+                        "重複したパケット識別子が割り当てられた"
+                    );
                 }
             } else if !allocated.is_empty() {
                 let ids: Vec<u16> = allocated.iter().copied().collect();
-                let idx = (*seed as usize) % ids.len();
+                let idx = (seed_value as usize) % ids.len();
                 let id = ids[idx];
                 allocated.remove(&id);
                 manager.release(id);
             }
-            prop_assert_eq!(manager.in_use_count(), allocated.len());
-            prop_assert_eq!(manager.is_available(), allocated.len() < 65535);
+            assert_eq!(manager.in_use_count(), allocated.len());
+            assert_eq!(manager.is_available(), allocated.len() < 65535);
         }
-    }
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    /// 割り当てと解放を繰り返しても不変条件が保たれる。
-    #[test]
-    fn packet_id_allocate_release_roundtrip(
-        (alloc_count, release_count) in (0usize..100usize, 0usize..100usize)
-    ) {
+/// 割り当てと解放を繰り返しても不変条件が保たれる。
+#[test]
+fn packet_id_allocate_release_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let alloc_count = noprop::sample_usize_in(ctx, 0..=100);
+        let release_count = noprop::sample_usize_in(ctx, 0..=100);
         let mut manager = PacketIdManager::new();
         let mut allocated = Vec::new();
 
@@ -44,8 +57,8 @@ proptest! {
             }
         }
         if alloc_count > 0 {
-            prop_assert!(manager.in_use_count() > 0);
-            prop_assert!(manager.is_available());
+            assert!(manager.in_use_count() > 0);
+            assert!(manager.is_available());
         }
 
         for i in 0..release_count {
@@ -54,22 +67,32 @@ proptest! {
             }
             let id = allocated.remove(0);
             manager.release(id);
-            prop_assert_eq!(manager.in_use_count(), alloc_count - (i + 1));
+            assert_eq!(manager.in_use_count(), alloc_count - (i + 1));
         }
-    }
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    /// 解放したパケット識別子は再度割り当てられ、
-    /// 解放していない識別子は再割り当てされない。
-    #[test]
-    fn packet_id_released_ids_are_reusable(
-        mask in proptest::collection::vec(any::<bool>(), 1..100)
-    ) {
+/// 解放したパケット識別子は再度割り当てられ、
+/// 解放していない識別子は再割り当てされない。
+#[test]
+fn packet_id_released_ids_are_reusable() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let mask_len = noprop::sample_usize_in(ctx, 1..=100);
         let mut manager = PacketIdManager::new();
 
-        let ids: Vec<u16> = mask
-            .iter()
-            .map(|_| manager.allocate().expect("パケット識別子を割り当てられること"))
+        let ids: Vec<u16> = (0..mask_len)
+            .map(|_| {
+                manager
+                    .allocate()
+                    .expect("パケット識別子を割り当てられること")
+            })
             .collect();
+        let mask: Vec<bool> = (0..mask_len).map(|_| noprop::sample_bool(ctx)).collect();
         let released: std::collections::BTreeSet<u16> = ids
             .iter()
             .zip(&mask)
@@ -90,30 +113,47 @@ proptest! {
             let id = manager
                 .allocate()
                 .expect("解放済みのパケット識別子が再割り当てされること");
-            prop_assert!(!kept.contains(&id), "使用中のパケット識別子が再割り当てされた");
-            prop_assert!(reallocated.insert(id), "重複したパケット識別子が割り当てられた");
+            assert!(
+                !kept.contains(&id),
+                "使用中のパケット識別子が再割り当てされた"
+            );
+            assert!(
+                reallocated.insert(id),
+                "重複したパケット識別子が割り当てられた"
+            );
         }
-        prop_assert_eq!(reallocated, released);
-    }
+        assert_eq!(reallocated, released);
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    /// リセット後は使用中が空になり、1 から再割り当てできる。
-    #[test]
-    fn packet_id_reset_clears_and_restarts(
-        mask in proptest::collection::vec(any::<bool>(), 1..50)
-    ) {
+/// リセット後は使用中が空になり、1 から再割り当てできる。
+#[test]
+fn packet_id_reset_clears_and_restarts() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let mask_len = noprop::sample_usize_in(ctx, 1..=50);
         let mut manager = PacketIdManager::new();
-        let ids: Vec<u16> = mask
-            .iter()
-            .map(|_| manager.allocate().expect("パケット識別子を割り当てられること"))
+        let ids: Vec<u16> = (0..mask_len)
+            .map(|_| {
+                manager
+                    .allocate()
+                    .expect("パケット識別子を割り当てられること")
+            })
             .collect();
-        for (id, release) in ids.iter().zip(&mask) {
-            if *release {
+        for id in &ids {
+            if noprop::sample_bool(ctx) {
                 manager.release(*id);
             }
         }
         manager.reset();
-        prop_assert_eq!(manager.in_use_count(), 0);
-        prop_assert!(manager.is_available());
-        prop_assert_eq!(manager.allocate(), Some(1));
-    }
+        assert_eq!(manager.in_use_count(), 0);
+        assert!(manager.is_available());
+        assert_eq!(manager.allocate(), Some(1));
+        Ok(())
+    })?;
+    Ok(())
 }
