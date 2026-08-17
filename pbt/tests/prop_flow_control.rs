@@ -52,9 +52,18 @@ fn flow_control_respects_send_limit() -> noprop::TestResult {
 
     // sends > max のケースが一度も生成されないと Err パスが空振りになるため、
     // ゲートで到達を保証する。
+    // p 推定値: sends ~ U(0..=200)・max ~ U(1..=100) で P(sends > max) ≈ 0.74。
+    // 256 ケースでの miss 確率は 0.26^256 ≈ 0。
     assert!(
         exceeded.get() > 0,
         "Receive Maximum 超過パスが一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
     );
     Ok(())
 }
@@ -107,9 +116,18 @@ fn flow_control_respects_receive_limit() -> noprop::TestResult {
 
     // receives > max のケースが一度も生成されないと Err パスが空振りになるため、
     // ゲートで到達を保証する。
+    // p 推定値: receives ~ U(0..=200)・max ~ U(1..=100) で P(receives > max) ≈ 0.74。
+    // 256 ケースでの miss 確率は 0.26^256 ≈ 0。
     assert!(
         exceeded.get() > 0,
         "Receive Maximum 超過パスが一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
     );
     Ok(())
 }
@@ -169,6 +187,8 @@ fn send_and_receive_quotas_are_independent() -> noprop::TestResult {
 
     // どちらか一方の超過パスが一度も生成されないと Err パスが空振りになるため、
     // 両方のゲートで到達を保証する。
+    // p 推定値: sends / receives ~ U(0..=60)・max ~ U(1..=50) で P(超過) ≈ 0.57。
+    // 256 ケースでの miss 確率は 0.43^256 ≈ 0。
     assert!(
         send_exceeded.get() > 0,
         "送信方向の Receive Maximum 超過パスが一度も検証されなかった\n{runner}"
@@ -176,6 +196,13 @@ fn send_and_receive_quotas_are_independent() -> noprop::TestResult {
     assert!(
         recv_exceeded.get() > 0,
         "受信方向の Receive Maximum 超過パスが一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
     );
     Ok(())
 }
@@ -214,5 +241,12 @@ fn flow_control_reset() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }

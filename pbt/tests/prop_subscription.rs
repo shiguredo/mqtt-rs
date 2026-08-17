@@ -81,6 +81,13 @@ fn subscribe_unsubscribe_roundtrip() -> noprop::TestResult {
         assert!(!manager.is_subscribed(&topic_filter));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -89,6 +96,8 @@ fn subscribe_unsubscribe_roundtrip() -> noprop::TestResult {
 #[test]
 fn multi_topic_suback_activates_only_successes() -> noprop::TestResult {
     let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let success_entries = std::cell::Cell::new(0usize);
+    let failure_entries = std::cell::Cell::new(0usize);
     let mut runner = noprop::Runner::new(seed);
 
     runner.run(256, |ctx| {
@@ -141,12 +150,29 @@ fn multi_topic_suback_activates_only_successes() -> noprop::TestResult {
                         .iter()
                         .any(|c| c.topic_filter == *topic && c.granted_qos == Some(*qos))
                 );
+                success_entries.set(success_entries.get() + 1);
             } else {
                 assert!(!manager.is_subscribed(topic));
+                failure_entries.set(failure_entries.get() + 1);
             }
         }
         Ok(())
     })?;
+
+    // 成功 (<= 0x02) と失敗 (>= 0x80) の両方の SUBACK 結果が一度も生成されないと
+    // 分岐が空振りになるため、両方のゲートで到達を保証する。
+    // p 推定値: 各エントリの success は 1/2・エントリ数は 1..=5。
+    // 全ケースで片側が 0 になる miss 確率は (1/2)^(全エントリ数) ≈ 0。
+    assert!(
+        success_entries.get() > 0,
+        "成功 SUBACK の分岐が一度も検証されなかった\n{runner}"
+    );
+    assert!(
+        failure_entries.get() > 0,
+        "失敗 SUBACK の分岐が一度も検証されなかった\n{runner}"
+    );
+    // トピックフィルタの重複は ctx.reject_case() で除外するため、棄却は想定内であり
+    // rejected_cases == 0 は検証しない。
     Ok(())
 }
 
@@ -189,6 +215,13 @@ fn suback_reason_code_shortage_does_not_activate() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -227,5 +260,7 @@ fn subscription_reset_clears_all() -> noprop::TestResult {
         assert!(manager.pending_unsubscribe_ids().is_empty());
         Ok(())
     })?;
+    // 識別子の一意性は ctx.reject_case() で担保するため、棄却は想定内であり
+    // rejected_cases == 0 は検証しない。
     Ok(())
 }

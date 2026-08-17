@@ -27,6 +27,13 @@ fn qos1_flow_completes() -> noprop::TestResult {
         assert_eq!(manager.needs_retransmission(packet_id), None);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -65,6 +72,13 @@ fn qos2_flow_completes() -> noprop::TestResult {
         assert_eq!(manager.needs_retransmission(packet_id), None);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -101,6 +115,13 @@ fn pubrel_always_answered_with_pubcomp() -> noprop::TestResult {
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -110,6 +131,8 @@ fn pubrel_always_answered_with_pubcomp() -> noprop::TestResult {
 #[test]
 fn qos2_pubrec_reason_code_boundary() -> noprop::TestResult {
     let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let send_pubrel = std::cell::Cell::new(0usize);
+    let aborted = std::cell::Cell::new(0usize);
     let mut runner = noprop::Runner::new(seed);
 
     runner.run(256, |ctx| {
@@ -122,13 +145,33 @@ fn qos2_pubrec_reason_code_boundary() -> noprop::TestResult {
         if reason_code < 0x80 {
             assert_eq!(action, Ok(Some(Action::SendPubrel { packet_id })));
             assert!(manager.is_active(packet_id));
+            send_pubrel.set(send_pubrel.get() + 1);
         } else {
             assert_eq!(action, Ok(Some(Action::Aborted { packet_id })));
             assert!(!manager.is_active(packet_id));
             assert_eq!(manager.needs_retransmission(packet_id), None);
+            aborted.set(aborted.get() + 1);
         }
         Ok(())
     })?;
+
+    // reason_code ~ U(0..=255) なので 0x80 境界の両側は p = 1/2 ずつ。
+    // 256 ケースでの miss 確率は (1/2)^256 ≈ 0。
+    assert!(
+        send_pubrel.get() > 0,
+        "PUBREL 送信側 (reason_code < 0x80) が一度も検証されなかった\n{runner}"
+    );
+    assert!(
+        aborted.get() > 0,
+        "フロー中断側 (reason_code >= 0x80) が一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -165,6 +208,13 @@ fn send_and_receive_flows_are_independent() -> noprop::TestResult {
         assert_eq!(manager.active_flow_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -185,6 +235,13 @@ fn qos1_flow_needs_retransmission() -> noprop::TestResult {
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -207,6 +264,13 @@ fn completed_flow_no_retransmission() -> noprop::TestResult {
         assert!(!manager.is_active(packet_id));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -242,6 +306,8 @@ fn reset_clears_all_flows() -> noprop::TestResult {
         }
         Ok(())
     })?;
+    // 識別子の一意性は ctx.reject_case() で担保するため、棄却は想定内であり
+    // rejected_cases == 0 は検証しない。
     Ok(())
 }
 
@@ -372,5 +438,12 @@ fn pending_order_matches_event_order() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
