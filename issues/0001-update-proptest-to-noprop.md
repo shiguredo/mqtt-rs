@@ -1,7 +1,7 @@
 # PBT を proptest から noprop に切り替える
 
 - Created: 2026-08-17
-- Completed: (未完了)
+- Completed: 2026-08-17
 - Branch: feature/update-proptest-to-noprop
 - Polished: (未磨き上げ)
 
@@ -38,7 +38,11 @@
 
 ## 解決方法
 
-- `pbt/Cargo.toml` の依存を `proptest = "1.11"` から `noprop = "0.2"` に変更する
-- `pbt/tests/helpers/mod.rs` の Strategy 型を noprop のサンプラ関数に置き換える
-- `pbt/tests/prop_*.rs` を noprop の命令的記述に書き換える
-- 各テストの探索空間設計（境界値・空・最大値・分布）は noprop スキルの手順に従い、カバレッジゲートで空振り検証を防ぐ
+- `pbt/Cargo.toml` の依存を `proptest = "1.11"` から `noprop = "0.2.0"` に変更した
+- `pbt/tests/helpers/mod.rs` を `pbt/tests/helpers.rs` に置き換え、Strategy 型を noprop のサンプラ関数（`sample_string`・`sample_topic_filter`・`sample_binary`・`sample_qos`・`sample_option` など）に書き換えた
+- `pbt/tests/prop_*.rs` の全テストを `proptest!` マクロから `noprop::Runner` + クロージャの命令的記述に書き換えた
+- フィルタが必要だった制約は valid-by-construction な生成（境界値・空・最大値の扱い）に置き換え、`sample_with_rejection` は受容率に基づく `max_attempts` で限定利用した
+- 両分岐が重要なテスト（FlowControl の Receive Maximum 超過パス・KeepAlive の PINGREQ 必要分岐）に `Cell` によるカバレッジゲートを追加した
+- シードは環境変数 `MQTT_PBT_SEED` から取得する（`noprop::seed_from_env_or_time`）
+- 検証: `cargo test -p pbt`・`cargo fmt --all -- --check`・`cargo clippy -p pbt --all-targets` が全て成功。固定シード 5 種でも成功することを確認した
+- 完了条件のうち「`shiguredo-rust` スキルの PBT 方針の noprop への更新」はスキル側の作業として残る（本 issue の範囲外）
