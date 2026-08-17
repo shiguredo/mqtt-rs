@@ -1,7 +1,7 @@
 # noprop スキル準拠に PBT を整備する
 
 - Created: 2026-08-17
-- Completed: (未完了)
+- Completed: 2026-08-17
 - Branch: feature/refactor-noprop-skill-compliance
 - Polished: (未磨き上げ)
 
@@ -34,9 +34,9 @@
 
 ## 解決方法
 
-- `pbt/tests/prop_*.rs` の各テストに `assert_eq!(runner.stats().rejected_cases, 0, ...)` を追加する（`ctx.reject_case()` を使う 3 テストを除く）
-- `prop_qos_flow.rs` の `qos2_pubrec_reason_code_boundary` に 0x80 境界の両分岐ゲートを追加する
-- `prop_subscription.rs` の `multi_topic_suback_activates_only_successes` に success / failure の両分岐ゲートを追加する
-- `prop_topic_alias.rs` の `send_alias_register_find_and_reuse` に枠埋まり分岐のゲートを追加する
-- 既存・新規ゲートに p 推定値と分岐重みの根拠コメントを追記する
-- 複数の固定シードで検証する
+- `pbt/tests/prop_*.rs` の各テストに `assert_eq!(runner.stats().rejected_cases, 0, ...)` を追加した（`ctx.reject_case()` を使う 3 テストは意図的に除外し、除外理由をコメントで明記）
+- `prop_qos_flow.rs` の `qos2_pubrec_reason_code_boundary` に 0x80 境界の両分岐ゲート（PUBREL 送信側 / フロー中断側）を追加した
+- `prop_subscription.rs` の `multi_topic_suback_activates_only_successes` に success / failure の両分岐ゲートを追加した
+- `prop_topic_alias.rs` の `send_alias_register_find_and_reuse` に枠埋まり分岐のゲートを追加した
+- 既存・新規ゲートに p 推定値と分岐重み・miss 確率の根拠コメントを追記した
+- 検証: `cargo test -p pbt`・`cargo fmt --all -- --check`・`cargo clippy -p pbt --all-targets -- -D warnings` が全て成功。固定シード 8 種で安定。既知の欠陥注入 2 件（`FlowControl::publish_sent` の Err 抑制・`reason_code` 生成の 0x80 以上限定）がそれぞれプロパティとゲートで検出されることを確認した
