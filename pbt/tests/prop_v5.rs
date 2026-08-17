@@ -2,8 +2,7 @@
 
 mod helpers;
 
-use proptest::prelude::*;
-use proptest::sample::select;
+use noprop::TestCaseContext;
 use shiguredo_mqtt::codec::limits::Limits;
 use shiguredo_mqtt::codec::qos::QoS;
 use shiguredo_mqtt::codec::variable_byte_integer::VariableByteInteger;
@@ -19,873 +18,754 @@ use shiguredo_mqtt::v5::packet::codec;
 use shiguredo_mqtt::v5::property::{Properties, Property};
 use shiguredo_mqtt::v5::subscribe::RetainHandling;
 
-use helpers::{binary_strategy, qos_strategy, string_strategy};
-
-fn user_property_strategy() -> impl Strategy<Value = Property> {
-    (string_strategy(), string_strategy())
-        .prop_map(|(key, value)| Property::UserProperty(key, value))
+/// 0..=1 の値を持つプロパティ値サンプラ。
+fn sample_zero_or_one(ctx: &mut TestCaseContext) -> u8 {
+    noprop::sample_usize_in(ctx, 0..=1) as u8
 }
 
-fn property_strategy() -> impl Strategy<Value = Property> {
-    prop_oneof![
-        (0u8..=1u8).prop_map(Property::PayloadFormatIndicator),
-        any::<u32>().prop_map(Property::MessageExpiryInterval),
-        string_strategy().prop_map(Property::ContentType),
-        string_strategy()
-            .prop_filter("Response Topic は空にできない", |s| !s.is_empty())
-            .prop_map(Property::ResponseTopic),
-        binary_strategy().prop_map(Property::CorrelationData),
-        (1u32..=VariableByteInteger::MAX)
-            .prop_map(|v| Property::SubscriptionIdentifier(VariableByteInteger(v))),
-        any::<u32>().prop_map(Property::SessionExpiryInterval),
-        string_strategy().prop_map(Property::AssignedClientIdentifier),
-        any::<u16>().prop_map(Property::ServerKeepAlive),
-        string_strategy().prop_map(Property::AuthenticationMethod),
-        binary_strategy().prop_map(Property::AuthenticationData),
-        (0u8..=1u8).prop_map(Property::RequestProblemInformation),
-        any::<u32>().prop_map(Property::WillDelayInterval),
-        (0u8..=1u8).prop_map(Property::RequestResponseInformation),
-        string_strategy().prop_map(Property::ResponseInformation),
-        string_strategy().prop_map(Property::ServerReference),
-        string_strategy().prop_map(Property::ReasonString),
-        (1u16..=u16::MAX).prop_map(Property::ReceiveMaximum),
-        any::<u16>().prop_map(Property::TopicAliasMaximum),
-        (1u16..=u16::MAX).prop_map(Property::TopicAlias),
-        (0u8..=1u8).prop_map(Property::MaximumQoS),
-        (0u8..=1u8).prop_map(Property::RetainAvailable),
-        user_property_strategy(),
-        (1u32..=u32::MAX).prop_map(Property::MaximumPacketSize),
-        (0u8..=1u8).prop_map(Property::WildcardSubscriptionAvailable),
-        (0u8..=1u8).prop_map(Property::SubscriptionIdentifierAvailable),
-        (0u8..=1u8).prop_map(Property::SharedSubscriptionAvailable),
-    ]
+/// 非ゼロ u16 サンプラ（1..=65535）。
+fn sample_nonzero_u16(ctx: &mut TestCaseContext) -> u16 {
+    noprop::sample_usize_in(ctx, 1..=u16::MAX as usize) as u16
 }
 
-fn connect_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        proptest::option::of(any::<u32>().prop_map(Property::SessionExpiryInterval)),
-        proptest::option::of((1..=u16::MAX).prop_map(Property::ReceiveMaximum)),
-        proptest::option::of((1..=u32::MAX).prop_map(Property::MaximumPacketSize)),
-        proptest::option::of(any::<u16>().prop_map(Property::TopicAliasMaximum)),
-        proptest::option::of((0u8..=1u8).prop_map(Property::RequestProblemInformation)),
-        proptest::option::of((0u8..=1u8).prop_map(Property::RequestResponseInformation)),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(
-            |(
-                session_expiry,
-                receive_maximum,
-                maximum_packet_size,
-                topic_alias_maximum,
-                request_problem_information,
-                request_response_information,
-                user_properties,
-            )| {
-                let mut props = Properties::new();
-                if let Some(p) = session_expiry {
-                    props.push(p);
-                }
-                if let Some(p) = receive_maximum {
-                    props.push(p);
-                }
-                if let Some(p) = maximum_packet_size {
-                    props.push(p);
-                }
-                if let Some(p) = topic_alias_maximum {
-                    props.push(p);
-                }
-                if let Some(p) = request_problem_information {
-                    props.push(p);
-                }
-                if let Some(p) = request_response_information {
-                    props.push(p);
-                }
-                for p in user_properties {
-                    props.push(p);
-                }
-                props
-            },
-        )
+/// 非ゼロ u32 サンプラ（1..=u32::MAX）。
+fn sample_nonzero_u32(ctx: &mut TestCaseContext) -> u32 {
+    noprop::sample_usize_in(ctx, 1..=u32::MAX as usize) as u32
 }
 
-fn connack_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        (
-            proptest::option::of(any::<u32>().prop_map(Property::SessionExpiryInterval)),
-            proptest::option::of((0u8..=1u8).prop_map(Property::MaximumQoS)),
-            proptest::option::of((1..=u16::MAX).prop_map(Property::ReceiveMaximum)),
-            proptest::option::of((1..=u32::MAX).prop_map(Property::MaximumPacketSize)),
-            proptest::option::of(any::<u16>().prop_map(Property::TopicAliasMaximum)),
-        ),
-        (
-            proptest::option::of((0u8..=1u8).prop_map(Property::RetainAvailable)),
-            proptest::option::of((0u8..=1u8).prop_map(Property::WildcardSubscriptionAvailable)),
-            proptest::option::of((0u8..=1u8).prop_map(Property::SubscriptionIdentifierAvailable)),
-            proptest::option::of((0u8..=1u8).prop_map(Property::SharedSubscriptionAvailable)),
-        ),
-        (
-            proptest::option::of(any::<u16>().prop_map(Property::ServerKeepAlive)),
-            proptest::option::of(string_strategy().prop_map(Property::AssignedClientIdentifier)),
-            proptest::option::of(string_strategy().prop_map(Property::ResponseInformation)),
-            proptest::option::of(string_strategy().prop_map(Property::ServerReference)),
-            proptest::option::of(string_strategy().prop_map(Property::ReasonString)),
-        ),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(
-            |(
-                (
-                    session_expiry,
-                    maximum_qos,
-                    receive_maximum,
-                    maximum_packet_size,
-                    topic_alias_maximum,
-                ),
-                (
-                    retain_available,
-                    wildcard_subscription_available,
-                    subscription_identifier_available,
-                    shared_subscription_available,
-                ),
-                (
-                    server_keep_alive,
-                    assigned_client_identifier,
-                    response_information,
-                    server_reference,
-                    reason_string,
-                ),
-                user_properties,
-            )| {
-                let mut props = Properties::new();
-                if let Some(p) = session_expiry {
-                    props.push(p);
-                }
-                if let Some(p) = maximum_qos {
-                    props.push(p);
-                }
-                if let Some(p) = receive_maximum {
-                    props.push(p);
-                }
-                if let Some(p) = maximum_packet_size {
-                    props.push(p);
-                }
-                if let Some(p) = topic_alias_maximum {
-                    props.push(p);
-                }
-                if let Some(p) = retain_available {
-                    props.push(p);
-                }
-                if let Some(p) = wildcard_subscription_available {
-                    props.push(p);
-                }
-                if let Some(p) = subscription_identifier_available {
-                    props.push(p);
-                }
-                if let Some(p) = shared_subscription_available {
-                    props.push(p);
-                }
-                if let Some(p) = server_keep_alive {
-                    props.push(p);
-                }
-                if let Some(p) = assigned_client_identifier {
-                    props.push(p);
-                }
-                if let Some(p) = response_information {
-                    props.push(p);
-                }
-                if let Some(p) = server_reference {
-                    props.push(p);
-                }
-                if let Some(p) = reason_string {
-                    props.push(p);
-                }
-                for p in user_properties {
-                    props.push(p);
-                }
-                props
-            },
-        )
+/// VBI 値サンプラ（1..=VariableByteInteger::MAX）。
+///
+/// 可変長バイト整数は 4 バイトで表現できる上限までしかエンコードできないため、
+/// Subscription Identifier などの VBI 値はこの上限で制約する。
+fn sample_vbi_value(ctx: &mut TestCaseContext) -> u32 {
+    noprop::sample_usize_in(ctx, 1..=VariableByteInteger::MAX as usize) as u32
 }
 
-fn publish_properties_strategy() -> impl Strategy<Value = Properties> {
-    // MQTT v5.0 §3.3.4 [MQTT-3.3.4-6]: Client → Server 方向の PUBLISH では Subscription Identifier (0x0B) は許可されない。
-    (
-        proptest::option::of((0u8..=1u8).prop_map(Property::PayloadFormatIndicator)),
-        proptest::option::of(any::<u32>().prop_map(Property::MessageExpiryInterval)),
-        proptest::option::of(string_strategy().prop_map(Property::ContentType)),
-        proptest::option::of(
-            string_strategy()
-                .prop_filter("Response Topic は空にできない", |s| !s.is_empty())
-                .prop_map(Property::ResponseTopic),
-        ),
-        proptest::option::of(binary_strategy().prop_map(Property::CorrelationData)),
-        proptest::option::of((1u16..=u16::MAX).prop_map(Property::TopicAlias)),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(
-            |(
-                payload_format,
-                message_expiry,
-                content_type,
-                response_topic,
-                correlation_data,
-                topic_alias,
-                user_properties,
-            )| {
-                let mut props = Properties::new();
-                if let Some(p) = payload_format {
-                    props.push(p);
-                }
-                if let Some(p) = message_expiry {
-                    props.push(p);
-                }
-                if let Some(p) = content_type {
-                    props.push(p);
-                }
-                if let Some(p) = response_topic {
-                    props.push(p);
-                }
-                if let Some(p) = correlation_data {
-                    props.push(p);
-                }
-                if let Some(p) = topic_alias {
-                    props.push(p);
-                }
-                for p in user_properties {
-                    props.push(p);
-                }
-                props
-            },
-        )
+fn sample_user_property(ctx: &mut TestCaseContext) -> Property {
+    let key = helpers::sample_string(ctx);
+    let value = helpers::sample_string(ctx);
+    Property::UserProperty(key, value)
 }
 
-fn subscribe_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        proptest::option::of(
-            (1u32..=VariableByteInteger::MAX)
-                .prop_map(|v| Property::SubscriptionIdentifier(VariableByteInteger(v))),
-        ),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(|(subscription_id, user_properties)| {
-            let mut props = Properties::new();
-            if let Some(p) = subscription_id {
-                props.push(p);
-            }
-            for p in user_properties {
-                props.push(p);
-            }
-            props
-        })
+fn sample_random_property(ctx: &mut TestCaseContext) -> Property {
+    match noprop::sample_usize_in(ctx, 0..28) {
+        0 => Property::PayloadFormatIndicator(sample_zero_or_one(ctx)),
+        1 => Property::MessageExpiryInterval(noprop::sample_u32(ctx)),
+        2 => Property::ContentType(helpers::sample_string(ctx)),
+        3 => Property::ResponseTopic(helpers::sample_string_in(ctx, 1, 100)),
+        4 => Property::CorrelationData(helpers::sample_binary(ctx)),
+        5 => Property::SubscriptionIdentifier(VariableByteInteger(sample_vbi_value(ctx))),
+        6 => Property::SessionExpiryInterval(noprop::sample_u32(ctx)),
+        7 => Property::AssignedClientIdentifier(helpers::sample_string(ctx)),
+        8 => Property::ServerKeepAlive(noprop::sample_u16(ctx)),
+        9 => Property::AuthenticationMethod(helpers::sample_string(ctx)),
+        10 => Property::AuthenticationData(helpers::sample_binary(ctx)),
+        11 => Property::RequestProblemInformation(sample_zero_or_one(ctx)),
+        12 => Property::WillDelayInterval(noprop::sample_u32(ctx)),
+        13 => Property::RequestResponseInformation(sample_zero_or_one(ctx)),
+        14 => Property::ResponseInformation(helpers::sample_string(ctx)),
+        15 => Property::ServerReference(helpers::sample_string(ctx)),
+        16 => Property::ReasonString(helpers::sample_string(ctx)),
+        17 => Property::ReceiveMaximum(sample_nonzero_u16(ctx)),
+        18 => Property::TopicAliasMaximum(noprop::sample_u16(ctx)),
+        19 => Property::TopicAlias(sample_nonzero_u16(ctx)),
+        20 => Property::MaximumQoS(sample_zero_or_one(ctx)),
+        21 => Property::RetainAvailable(sample_zero_or_one(ctx)),
+        22 => sample_user_property(ctx),
+        23 => Property::MaximumPacketSize(sample_nonzero_u32(ctx)),
+        24 => Property::WildcardSubscriptionAvailable(sample_zero_or_one(ctx)),
+        25 => Property::SubscriptionIdentifierAvailable(sample_zero_or_one(ctx)),
+        _ => Property::SharedSubscriptionAvailable(sample_zero_or_one(ctx)),
+    }
 }
 
-fn will_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        proptest::option::of(any::<u32>().prop_map(Property::WillDelayInterval)),
-        proptest::option::of((0u8..=1u8).prop_map(Property::PayloadFormatIndicator)),
-        proptest::option::of(any::<u32>().prop_map(Property::MessageExpiryInterval)),
-        proptest::option::of(string_strategy().prop_map(Property::ContentType)),
-        proptest::option::of(
-            string_strategy()
-                .prop_filter("Response Topic は空にできない", |s| !s.is_empty())
-                .prop_map(Property::ResponseTopic),
-        ),
-        proptest::option::of(binary_strategy().prop_map(Property::CorrelationData)),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(
-            |(
-                will_delay_interval,
-                payload_format,
-                message_expiry,
-                content_type,
-                response_topic,
-                correlation_data,
-                user_properties,
-            )| {
-                let mut props = Properties::new();
-                if let Some(p) = will_delay_interval {
-                    props.push(p);
-                }
-                if let Some(p) = payload_format {
-                    props.push(p);
-                }
-                if let Some(p) = message_expiry {
-                    props.push(p);
-                }
-                if let Some(p) = content_type {
-                    props.push(p);
-                }
-                if let Some(p) = response_topic {
-                    props.push(p);
-                }
-                if let Some(p) = correlation_data {
-                    props.push(p);
-                }
-                for p in user_properties {
-                    props.push(p);
-                }
-                props
-            },
-        )
+fn sample_connect_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::SessionExpiryInterval(noprop::sample_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) =
+        helpers::sample_option(ctx, |ctx| Property::ReceiveMaximum(sample_nonzero_u16(ctx)))
+    {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::MaximumPacketSize(sample_nonzero_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::TopicAliasMaximum(noprop::sample_u16(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::RequestProblemInformation(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::RequestResponseInformation(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn disconnect_properties_strategy() -> impl Strategy<Value = Properties> {
-    // Client → Server 方向の DISCONNECT では Session Expiry Interval (0x11) が許可されるが、
-    // PBT の roundtrip は encode → decode なので、decode 側の Server → Client 制約（MQTT v5.0 §3.14.2.2.2 [MQTT-3.14.2-2]）に引っかかる。
-    // ここでは許可される Reason String と User Property のみを生成する。
-    (
-        proptest::option::of(string_strategy().prop_map(Property::ReasonString)),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(|(reason_string, user_properties)| {
-            let mut props = Properties::new();
-            if let Some(p) = reason_string {
-                props.push(p);
-            }
-            for p in user_properties {
-                props.push(p);
-            }
-            props
-        })
+fn sample_connack_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::SessionExpiryInterval(noprop::sample_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) =
+        helpers::sample_option(ctx, |ctx| Property::MaximumQoS(sample_zero_or_one(ctx)))
+    {
+        props.push(p);
+    }
+    if let Some(p) =
+        helpers::sample_option(ctx, |ctx| Property::ReceiveMaximum(sample_nonzero_u16(ctx)))
+    {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::MaximumPacketSize(sample_nonzero_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::TopicAliasMaximum(noprop::sample_u16(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::RetainAvailable(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::WildcardSubscriptionAvailable(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::SubscriptionIdentifierAvailable(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::SharedSubscriptionAvailable(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ServerKeepAlive(noprop::sample_u16(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::AssignedClientIdentifier(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ResponseInformation(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ServerReference(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ReasonString(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn auth_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        string_strategy().prop_map(Property::AuthenticationMethod),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(|(auth_method, user_properties)| {
-            let mut props = Properties::new();
-            // MQTT v5.0 §3.15.2.2.2: AUTH パケットには Authentication Method が必須。
-            props.push(auth_method);
-            for p in user_properties {
-                props.push(p);
-            }
-            props
-        })
+fn sample_publish_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::PayloadFormatIndicator(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::MessageExpiryInterval(noprop::sample_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ContentType(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ResponseTopic(helpers::sample_string_in(ctx, 1, 100))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::CorrelationData(helpers::sample_binary(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) =
+        helpers::sample_option(ctx, |ctx| Property::TopicAlias(sample_nonzero_u16(ctx)))
+    {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn reason_code_properties_strategy() -> impl Strategy<Value = Properties> {
-    (
-        proptest::option::of(string_strategy().prop_map(Property::ReasonString)),
-        proptest::collection::vec(user_property_strategy(), 0..3),
-    )
-        .prop_map(|(reason_string, user_properties)| {
-            let mut props = Properties::new();
-            if let Some(p) = reason_string {
-                props.push(p);
-            }
-            for p in user_properties {
-                props.push(p);
-            }
-            props
-        })
+fn sample_subscribe_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::SubscriptionIdentifier(VariableByteInteger(sample_vbi_value(ctx)))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn empty_properties_strategy() -> impl Strategy<Value = Properties> {
-    Just(Properties::new())
+fn sample_will_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::WillDelayInterval(noprop::sample_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::PayloadFormatIndicator(sample_zero_or_one(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::MessageExpiryInterval(noprop::sample_u32(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ContentType(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ResponseTopic(helpers::sample_string_in(ctx, 1, 100))
+    }) {
+        props.push(p);
+    }
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::CorrelationData(helpers::sample_binary(ctx))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn will_strategy() -> impl Strategy<Value = v5::connect::Will> {
-    (
-        string_strategy(),
-        qos_strategy(),
-        any::<bool>(),
-        binary_strategy(),
-        will_properties_strategy(),
-    )
-        .prop_filter("Will Topic は空にできない", |(topic, _, _, _, _)| {
-            !topic.is_empty()
-        })
-        .prop_filter(
-            "Will Topic にワイルドカード文字は使用できない",
-            |(topic, _, _, _, _)| !topic.contains('+') && !topic.contains('#'),
-        )
-        .prop_map(|(topic, qos, retain, payload, properties)| {
-            // MQTT v5.0 §3.1.3.2.3: Payload Format Indicator が 1 の場合、
-            // Will Payload は well-formed UTF-8 でなければならないため、
-            // 生成した任意バイト列を有効な UTF-8 に変換する。
-            let payload = if properties
-                .iter()
-                .any(|p| matches!(p, Property::PayloadFormatIndicator(1)))
-            {
-                String::from_utf8_lossy(&payload).into_owned().into_bytes()
-            } else {
-                payload
-            };
-            v5::connect::Will {
-                topic,
-                qos,
-                retain,
-                payload,
-                properties,
-            }
-        })
+fn sample_disconnect_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ReasonString(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn connect_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        string_strategy(),
-        any::<bool>(),
-        any::<u16>(),
-        connect_properties_strategy(),
-        proptest::option::of(will_strategy()),
-        proptest::option::of(string_strategy()),
-        proptest::option::of(binary_strategy()),
-    )
-        .prop_map(
-            |(client_id, clean_start, keep_alive, properties, will, username, password)| {
-                codec::Packet::Connect(v5::connect::Connect {
-                    client_id,
-                    clean_start,
-                    keep_alive,
-                    properties,
-                    will,
-                    username,
-                    password,
-                })
-            },
-        )
+fn sample_auth_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    // MQTT v5.0 §3.15.2.2.2: AUTH パケットには Authentication Method が必須。
+    props.push(Property::AuthenticationMethod(helpers::sample_string(ctx)));
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
 }
 
-fn connack_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        any::<bool>(),
-        select(&[
+fn sample_reason_code_properties(ctx: &mut TestCaseContext) -> Properties {
+    let mut props = Properties::new();
+    if let Some(p) = helpers::sample_option(ctx, |ctx| {
+        Property::ReasonString(helpers::sample_string(ctx))
+    }) {
+        props.push(p);
+    }
+    for _ in 0..noprop::sample_usize_in(ctx, 0..=3) {
+        props.push(sample_user_property(ctx));
+    }
+    props
+}
+
+fn sample_will(ctx: &mut TestCaseContext) -> v5::connect::Will {
+    // Will Topic は空にできず、ワイルドカード文字も使用できない。
+    // 文字列サンプラがワイルドカードを除外済みのため、空を避けるだけでよい。
+    let topic = helpers::sample_string_in(ctx, 1, 100);
+    let qos = helpers::sample_qos(ctx);
+    let retain = noprop::sample_bool(ctx);
+    let payload = helpers::sample_binary(ctx);
+    let properties = sample_will_properties(ctx);
+    // MQTT v5.0 §3.1.3.2.3: Payload Format Indicator が 1 の場合、
+    // Will Payload は well-formed UTF-8 でなければならないため、
+    // 生成した任意バイト列を有効な UTF-8 に変換する。
+    let payload = if properties
+        .iter()
+        .any(|p| matches!(p, Property::PayloadFormatIndicator(1)))
+    {
+        String::from_utf8_lossy(&payload).into_owned().into_bytes()
+    } else {
+        payload
+    };
+    v5::connect::Will {
+        topic,
+        qos,
+        retain,
+        payload,
+        properties,
+    }
+}
+
+fn sample_connect(ctx: &mut TestCaseContext) -> codec::Packet {
+    let client_id = helpers::sample_string(ctx);
+    let clean_start = noprop::sample_bool(ctx);
+    let keep_alive = noprop::sample_u16(ctx);
+    let properties = sample_connect_properties(ctx);
+    let will = helpers::sample_option(ctx, sample_will);
+    let username = helpers::sample_option(ctx, helpers::sample_string);
+    let password = helpers::sample_option(ctx, helpers::sample_binary);
+
+    codec::Packet::Connect(v5::connect::Connect {
+        client_id,
+        clean_start,
+        keep_alive,
+        properties,
+        will,
+        username,
+        password,
+    })
+}
+
+fn sample_connack(ctx: &mut TestCaseContext) -> codec::Packet {
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::connack::ConnectReasonCode::Success,
             v5::connack::ConnectReasonCode::NotAuthorized,
             v5::connack::ConnectReasonCode::ServerUnavailable,
-        ]),
-        connack_properties_strategy(),
-    )
-        .prop_filter(
-            "session_present は Success の場合のみ true",
-            |(session_present, reason_code, _)| {
-                !(*session_present && *reason_code != v5::connack::ConnectReasonCode::Success)
-            },
-        )
-        .prop_map(|(session_present, reason_code, properties)| {
-            codec::Packet::ConnAck(v5::connack::ConnAck {
-                session_present,
-                reason_code,
-                properties,
-            })
-        })
+        ],
+    );
+    // session_present は Success の場合のみ true（valid-by-construction）。
+    let session_present =
+        reason_code == v5::connack::ConnectReasonCode::Success && noprop::sample_bool(ctx);
+    let properties = sample_connack_properties(ctx);
+
+    codec::Packet::ConnAck(v5::connack::ConnAck {
+        session_present,
+        reason_code,
+        properties,
+    })
 }
 
-fn publish_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        string_strategy(),
-        qos_strategy(),
-        any::<u16>(),
-        any::<bool>(),
-        any::<bool>(),
-        binary_strategy(),
-        publish_properties_strategy(),
-    )
-        .prop_filter(
-            "有効な PUBLISH パケット識別子",
-            |(_, qos, packet_id, dup, _, _, _)| {
-                if *qos == QoS::AtMostOnce {
-                    *packet_id == 0 && !dup
-                } else {
-                    *packet_id != 0
-                }
-            },
-        )
-        .prop_filter(
-            "PUBLISH のトピック名にワイルドカード文字を含めない",
-            |(topic, _, _, _, _, _, _)| !topic.contains('#') && !topic.contains('+'),
-        )
-        .prop_filter(
-            "PUBLISH のトピック名は空にできない（TopicAlias なしの場合）",
-            |(topic, _, _, _, _, _, properties)| {
-                !topic.is_empty()
-                    || properties
-                        .iter()
-                        .any(|p| matches!(p, Property::TopicAlias(_)))
-            },
-        )
-        .prop_map(
-            |(topic, qos, packet_id, dup, retain, payload, properties)| {
-                let id = if qos == QoS::AtMostOnce {
-                    None
-                } else {
-                    Some(packet_id)
-                };
-                // MQTT v5.0 §3.3.2.3.2: Payload Format Indicator が 1 の場合、
-                // Payload は well-formed UTF-8 でなければならないため、
-                // 生成した任意バイト列を有効な UTF-8 に変換する。
-                let payload = if properties
-                    .iter()
-                    .any(|p| matches!(p, Property::PayloadFormatIndicator(1)))
-                {
-                    String::from_utf8_lossy(&payload).into_owned().into_bytes()
-                } else {
-                    payload
-                };
-                codec::Packet::Publish(v5::publish::Publish {
-                    dup,
-                    qos,
-                    retain,
-                    topic,
-                    packet_id: id,
-                    properties,
-                    payload,
-                })
-            },
-        )
+fn sample_publish(ctx: &mut TestCaseContext) -> codec::Packet {
+    let qos = helpers::sample_qos(ctx);
+    let properties = sample_publish_properties(ctx);
+    let has_topic_alias = properties
+        .iter()
+        .any(|p| matches!(p, Property::TopicAlias(_)));
+    // PUBLISH のトピック名は空にできない（TopicAlias ありの場合は空を許容）。
+    // TopicAlias の有無を先に決めてから、トピック長を valid-by-construction で制約する。
+    let topic = if has_topic_alias {
+        helpers::sample_string(ctx)
+    } else {
+        helpers::sample_string_in(ctx, 1, 100)
+    };
+    // QoS 0 のときは packet_id なし (0) かつ dup: false でなければならない。
+    // （MQTT v5.0 §3.3.1.2 / MQTT v5.0 §3.3.1.1 [MQTT-3.3.1-2]）
+    let packet_id = if qos == QoS::AtMostOnce {
+        0
+    } else {
+        noprop::sample_usize_in(ctx, 1..=u16::MAX as usize) as u16
+    };
+    let dup = qos != QoS::AtMostOnce && noprop::sample_bool(ctx);
+    let retain = noprop::sample_bool(ctx);
+    let payload = helpers::sample_binary(ctx);
+    // MQTT v5.0 §3.3.2.3.2: Payload Format Indicator が 1 の場合、
+    // Payload は well-formed UTF-8 でなければならないため、
+    // 生成した任意バイト列を有効な UTF-8 に変換する。
+    let payload = if properties
+        .iter()
+        .any(|p| matches!(p, Property::PayloadFormatIndicator(1)))
+    {
+        String::from_utf8_lossy(&payload).into_owned().into_bytes()
+    } else {
+        payload
+    };
+
+    codec::Packet::Publish(v5::publish::Publish {
+        dup,
+        qos,
+        retain,
+        topic,
+        packet_id: (packet_id != 0).then_some(packet_id),
+        properties,
+        payload,
+    })
 }
 
-fn puback_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        // MQTT v5.0 §3.4.2.1: 0x10 No matching subscribers はサーバー専用のため、
-        // クライアント送信（encode → decode roundtrip）の対象から除外する。
-        select(&[
+fn sample_puback(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    // MQTT v5.0 §3.4.2.1: 0x10 No matching subscribers はサーバー専用のため、
+    // クライアント送信（encode → decode roundtrip）の対象から除外する。
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::puback::PubAckReasonCode::Success,
             v5::puback::PubAckReasonCode::QuotaExceeded,
             v5::puback::PubAckReasonCode::NotAuthorized,
-        ]),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_code, properties)| {
-            codec::Packet::PubAck(v5::puback::PubAck {
-                packet_id,
-                reason_code,
-                properties,
-            })
-        })
+        ],
+    );
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::PubAck(v5::puback::PubAck {
+        packet_id,
+        reason_code,
+        properties,
+    })
 }
 
-fn pubrec_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        // MQTT v5.0 §3.5.2.1: 0x10 No matching subscribers はサーバー専用のため、
-        // クライアント送信（encode → decode roundtrip）の対象から除外する。
-        select(&[
+fn sample_pubrec(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    // MQTT v5.0 §3.5.2.1: 0x10 No matching subscribers はサーバー専用のため、
+    // クライアント送信（encode → decode roundtrip）の対象から除外する。
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::pubrec::PubRecReasonCode::Success,
             v5::pubrec::PubRecReasonCode::QuotaExceeded,
             v5::pubrec::PubRecReasonCode::NotAuthorized,
-        ]),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_code, properties)| {
-            codec::Packet::PubRec(v5::pubrec::PubRec {
-                packet_id,
-                reason_code,
-                properties,
-            })
-        })
+        ],
+    );
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::PubRec(v5::pubrec::PubRec {
+        packet_id,
+        reason_code,
+        properties,
+    })
 }
 
-fn pubrel_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        select(&[
+fn sample_pubrel(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::pubrel::PubRelReasonCode::Success,
             v5::pubrel::PubRelReasonCode::PacketIdentifierNotFound,
-        ]),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_code, properties)| {
-            codec::Packet::PubRel(v5::pubrel::PubRel {
-                packet_id,
-                reason_code,
-                properties,
-            })
-        })
+        ],
+    );
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::PubRel(v5::pubrel::PubRel {
+        packet_id,
+        reason_code,
+        properties,
+    })
 }
 
-fn pubcomp_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        select(&[
+fn sample_pubcomp(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::pubcomp::PubCompReasonCode::Success,
             v5::pubcomp::PubCompReasonCode::PacketIdentifierNotFound,
-        ]),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_code, properties)| {
-            codec::Packet::PubComp(v5::pubcomp::PubComp {
-                packet_id,
-                reason_code,
-                properties,
-            })
-        })
+        ],
+    );
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::PubComp(v5::pubcomp::PubComp {
+        packet_id,
+        reason_code,
+        properties,
+    })
 }
 
-fn normal_topic_filter_strategy() -> impl Strategy<Value = (String, bool)> {
-    helpers::topic_filter_strategy().prop_map(|s| (s, false))
+/// 通常トピックフィルターサンプラ。`(フィルター, false)` を返す。
+fn sample_normal_topic_filter(ctx: &mut TestCaseContext) -> (String, bool) {
+    (helpers::sample_topic_filter(ctx), false)
 }
 
-fn shared_topic_filter_strategy() -> impl Strategy<Value = (String, bool)> {
-    (
-        proptest::collection::vec(
-            any::<char>().prop_filter("ShareName に /, +, #, NUL は使用できない", |c| {
-                *c != '\0' && *c != '/' && *c != '+' && *c != '#'
-            }),
-            1..20,
-        )
-        .prop_map(|chars| chars.into_iter().collect::<String>()),
-        helpers::topic_filter_strategy(),
-    )
-        .prop_map(|(share_name, filter)| (format!("$share/{}/{}", share_name, filter), true))
+/// 共有トピックフィルターサンプラ。`(フィルター, true)` を返す。
+fn sample_shared_topic_filter(ctx: &mut TestCaseContext) -> (String, bool) {
+    // ShareName に /, +, #, NUL は使用できない（valid-by-construction）。
+    let share_len = noprop::sample_usize_in(ctx, 1..=20);
+    let mut share_name = String::with_capacity(share_len);
+    for _ in 0..share_len {
+        // 除外文字は 4 種のみであり、受容率は 0.999996 を超える。
+        let c = noprop::sample_with_rejection(ctx, 8, |ctx| {
+            let c = noprop::sample_char(ctx);
+            (c != '\0' && c != '/' && c != '+' && c != '#').then_some(c)
+        });
+        share_name.push(c);
+    }
+    let filter = helpers::sample_topic_filter(ctx);
+    (format!("$share/{}/{}", share_name, filter), true)
 }
 
-fn topic_filter_strategy() -> impl Strategy<Value = (String, bool)> {
-    prop_oneof![
-        normal_topic_filter_strategy(),
-        shared_topic_filter_strategy(),
-    ]
+/// トピックフィルターサンプラ（通常・共有のどちらか）。
+fn sample_v5_topic_filter(ctx: &mut TestCaseContext) -> (String, bool) {
+    match noprop::sample_usize_in(ctx, 0..2) {
+        0 => sample_normal_topic_filter(ctx),
+        _ => sample_shared_topic_filter(ctx),
+    }
 }
 
-fn subscription_strategy() -> impl Strategy<Value = v5::subscribe::Subscription> {
-    (
-        topic_filter_strategy(),
-        qos_strategy(),
-        any::<bool>(),
-        any::<bool>(),
-        select(&[
+fn sample_subscription(ctx: &mut TestCaseContext) -> v5::subscribe::Subscription {
+    let (topic_filter, is_shared) = sample_v5_topic_filter(ctx);
+    let qos = helpers::sample_qos(ctx);
+    // MQTT v5.0 §3.8.3.1 [MQTT-3.8.3-4]:
+    // 共有サブスクリプションで No Local ビットを 1 にすることは Protocol Error である。
+    let no_local = !is_shared && noprop::sample_bool(ctx);
+    let retain_as_published = noprop::sample_bool(ctx);
+    let retain_handling = noprop::sample_choice(
+        ctx,
+        &[
             RetainHandling::SendRetained,
             RetainHandling::SendRetainedIfNotExists,
             RetainHandling::DoNotSendRetained,
-        ]),
+        ],
+    );
+    v5::subscribe::Subscription {
+        topic_filter,
+        qos,
+        no_local,
+        retain_as_published,
+        retain_handling,
+    }
+}
+
+fn sample_subscribe(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let count = noprop::sample_usize_in(ctx, 1..=4);
+    let mut subscriptions = Vec::with_capacity(count);
+    for _ in 0..count {
+        subscriptions.push(sample_subscription(ctx));
+    }
+    let properties = sample_subscribe_properties(ctx);
+    codec::Packet::Subscribe(v5::subscribe::Subscribe {
+        packet_id,
+        subscriptions,
+        properties,
+    })
+}
+
+fn sample_suback_reason_code(ctx: &mut TestCaseContext) -> v5::suback::SubAckReasonCode {
+    noprop::sample_choice(
+        ctx,
+        &[
+            v5::suback::SubAckReasonCode::GrantedQoS0,
+            v5::suback::SubAckReasonCode::GrantedQoS1,
+            v5::suback::SubAckReasonCode::GrantedQoS2,
+            v5::suback::SubAckReasonCode::NotAuthorized,
+        ],
     )
-        .prop_filter(
-            // MQTT v5.0 §3.8.3.1 [MQTT-3.8.3-4]:
-            // 共有サブスクリプションで No Local ビットを 1 にすることは Protocol Error である。
-            "共有サブスクリプションでは no_local は false でなければならない",
-            |((_, is_shared), _, no_local, _, _)| !is_shared || !no_local,
-        )
-        .prop_map(
-            |((topic_filter, _is_shared), qos, no_local, retain_as_published, retain_handling)| {
-                v5::subscribe::Subscription {
-                    topic_filter,
-                    qos,
-                    no_local,
-                    retain_as_published,
-                    retain_handling,
-                }
-            },
-        )
 }
 
-fn subscribe_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        proptest::collection::vec(subscription_strategy(), 1..5),
-        subscribe_properties_strategy(),
+fn sample_suback(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let count = noprop::sample_usize_in(ctx, 1..=4);
+    let mut reason_codes = Vec::with_capacity(count);
+    for _ in 0..count {
+        reason_codes.push(sample_suback_reason_code(ctx));
+    }
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::SubAck(v5::suback::SubAck {
+        packet_id,
+        reason_codes,
+        properties,
+    })
+}
+
+fn sample_unsubscribe(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let count = noprop::sample_usize_in(ctx, 1..=4);
+    let mut topic_filters = Vec::with_capacity(count);
+    for _ in 0..count {
+        topic_filters.push(helpers::sample_topic_filter(ctx));
+    }
+    codec::Packet::Unsubscribe(v5::unsubscribe::Unsubscribe {
+        packet_id,
+        topic_filters,
+        properties: Properties::new(),
+    })
+}
+
+fn sample_unsuback_reason_code(ctx: &mut TestCaseContext) -> v5::unsuback::UnsubAckReasonCode {
+    noprop::sample_choice(
+        ctx,
+        &[
+            v5::unsuback::UnsubAckReasonCode::Success,
+            v5::unsuback::UnsubAckReasonCode::NoSubscriptionExisted,
+            v5::unsuback::UnsubAckReasonCode::NotAuthorized,
+        ],
     )
-        .prop_map(|(packet_id, subscriptions, properties)| {
-            codec::Packet::Subscribe(v5::subscribe::Subscribe {
-                packet_id,
-                subscriptions,
-                properties,
-            })
-        })
 }
 
-fn suback_reason_code_strategy() -> impl Strategy<Value = v5::suback::SubAckReasonCode> {
-    select(&[
-        v5::suback::SubAckReasonCode::GrantedQoS0,
-        v5::suback::SubAckReasonCode::GrantedQoS1,
-        v5::suback::SubAckReasonCode::GrantedQoS2,
-        v5::suback::SubAckReasonCode::NotAuthorized,
-    ])
+fn sample_unsuback(ctx: &mut TestCaseContext) -> codec::Packet {
+    let packet_id = sample_nonzero_u16(ctx);
+    let count = noprop::sample_usize_in(ctx, 1..=4);
+    let mut reason_codes = Vec::with_capacity(count);
+    for _ in 0..count {
+        reason_codes.push(sample_unsuback_reason_code(ctx));
+    }
+    let properties = sample_reason_code_properties(ctx);
+    codec::Packet::UnsubAck(v5::unsuback::UnsubAck {
+        packet_id,
+        reason_codes,
+        properties,
+    })
 }
 
-fn suback_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        proptest::collection::vec(suback_reason_code_strategy(), 1..5),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_codes, properties)| {
-            codec::Packet::SubAck(v5::suback::SubAck {
-                packet_id,
-                reason_codes,
-                properties,
-            })
-        })
-}
-
-fn unsubscribe_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        proptest::collection::vec(helpers::topic_filter_strategy(), 1..5),
-        empty_properties_strategy(),
-    )
-        .prop_map(|(packet_id, topic_filters, properties)| {
-            codec::Packet::Unsubscribe(v5::unsubscribe::Unsubscribe {
-                packet_id,
-                topic_filters,
-                properties,
-            })
-        })
-}
-
-fn unsuback_reason_code_strategy() -> impl Strategy<Value = v5::unsuback::UnsubAckReasonCode> {
-    select(&[
-        v5::unsuback::UnsubAckReasonCode::Success,
-        v5::unsuback::UnsubAckReasonCode::NoSubscriptionExisted,
-        v5::unsuback::UnsubAckReasonCode::NotAuthorized,
-    ])
-}
-
-fn unsuback_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        1..=u16::MAX,
-        proptest::collection::vec(unsuback_reason_code_strategy(), 1..5),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(packet_id, reason_codes, properties)| {
-            codec::Packet::UnsubAck(v5::unsuback::UnsubAck {
-                packet_id,
-                reason_codes,
-                properties,
-            })
-        })
-}
-
-fn disconnect_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        // packet_roundtrip は encode -> decode を検証するため、
-        // Client → Server と Server → Client の両方向で合法な Reason Code のみを使う。
-        select(&[
+fn sample_disconnect(ctx: &mut TestCaseContext) -> codec::Packet {
+    // packet_roundtrip は encode -> decode を検証するため、
+    // Client → Server と Server → Client の両方向で合法な Reason Code のみを使う。
+    let reason_code = noprop::sample_choice(
+        ctx,
+        &[
             v5::disconnect::DisconnectReasonCode::NormalDisconnection,
             v5::disconnect::DisconnectReasonCode::UnspecifiedError,
             v5::disconnect::DisconnectReasonCode::BadAuthenticationMethod,
-        ]),
-        disconnect_properties_strategy(),
-    )
-        .prop_map(|(reason_code, properties)| {
-            codec::Packet::Disconnect(v5::disconnect::Disconnect {
-                reason_code,
+        ],
+    );
+    let properties = sample_disconnect_properties(ctx);
+    codec::Packet::Disconnect(v5::disconnect::Disconnect {
+        reason_code,
+        properties,
+    })
+}
+
+fn sample_auth(ctx: &mut TestCaseContext) -> codec::Packet {
+    // packet_roundtrip は encode -> decode を検証するため、
+    // 両方向で合法な Reason Code（0x18）のみを使う。0x00 は encode 不可、
+    // 0x19 は decode 不可のため片方向専用テスト側で扱う。
+    let properties = sample_auth_properties(ctx);
+    codec::Packet::Auth(v5::auth::Auth {
+        reason_code: v5::auth::AuthReasonCode::ContinueAuthentication,
+        properties,
+    })
+}
+
+/// 全種別の `codec::Packet` を生成するサンプラ（低水準 codec のラウンドトリップ検証用）。
+fn sample_codec_packet(ctx: &mut TestCaseContext) -> codec::Packet {
+    match noprop::sample_usize_in(ctx, 0..15) {
+        0 => sample_connect(ctx),
+        1 => sample_connack(ctx),
+        2 => sample_publish(ctx),
+        3 => sample_puback(ctx),
+        4 => sample_pubrec(ctx),
+        5 => sample_pubrel(ctx),
+        6 => sample_pubcomp(ctx),
+        7 => sample_subscribe(ctx),
+        8 => sample_suback(ctx),
+        9 => sample_unsubscribe(ctx),
+        10 => sample_unsuback(ctx),
+        11 => codec::Packet::PingReq(v5::pingreq::PingReq),
+        12 => codec::Packet::PingResp(v5::pingresp::PingResp),
+        13 => sample_disconnect(ctx),
+        _ => sample_auth(ctx),
+    }
+}
+
+/// Server → Client 方向の種別のみを生成するサンプラ（Decoder 経由のラウンドトリップ検証用）。
+/// 双方向種別（PUBLISH / PUBACK 系 / DISCONNECT / AUTH）は両方向で合法な
+/// Reason Code とプロパティのみを生成するため、encode（Client → Server 検証）と
+/// decode（Server → Client 検証）の両方を通る。
+fn sample_incoming_packet(ctx: &mut TestCaseContext) -> codec::Packet {
+    match noprop::sample_usize_in(ctx, 0..11) {
+        0 => sample_connack(ctx),
+        1 => sample_publish(ctx),
+        2 => sample_puback(ctx),
+        3 => sample_pubrec(ctx),
+        4 => sample_pubrel(ctx),
+        5 => sample_pubcomp(ctx),
+        6 => sample_suback(ctx),
+        7 => sample_unsuback(ctx),
+        8 => codec::Packet::PingResp(v5::pingresp::PingResp),
+        9 => sample_disconnect(ctx),
+        _ => sample_auth(ctx),
+    }
+}
+
+/// Client → Server 専用種別のみを生成するサンプラ（Decoder の方向拒否検証用）。
+fn sample_outgoing_only_packet(ctx: &mut TestCaseContext) -> codec::Packet {
+    match noprop::sample_usize_in(ctx, 0..4) {
+        0 => sample_connect(ctx),
+        1 => sample_subscribe(ctx),
+        2 => sample_unsubscribe(ctx),
+        _ => codec::Packet::PingReq(v5::pingreq::PingReq),
+    }
+}
+
+/// Server → Client 側専用の Reason Code やプロパティを含む OutgoingPacket を
+/// 生成するサンプラ。encode が Err(EncodeError::InvalidField { .. }) を返すことを検証する。
+fn sample_reverse_direction_outgoing(ctx: &mut TestCaseContext) -> OutgoingPacket {
+    match noprop::sample_usize_in(ctx, 0..5) {
+        0 => {
+            // Success (0x00) は Server 側専用の Reason Code（MQTT v5.0 §3.15.2.1 Table 3-11）
+            let properties = sample_auth_properties(ctx);
+            OutgoingPacket::Auth(v5::auth::Auth {
+                reason_code: v5::auth::AuthReasonCode::Success,
                 properties,
             })
-        })
-}
-
-fn auth_strategy() -> impl Strategy<Value = codec::Packet> {
-    (
-        // packet_roundtrip は encode -> decode を検証するため、
-        // 両方向で合法な Reason Code（0x18）のみを使う。0x00 は encode 不可、
-        // 0x19 は decode 不可のため片方向専用テスト側で扱う。
-        select(&[v5::auth::AuthReasonCode::ContinueAuthentication]),
-        auth_properties_strategy(),
-    )
-        .prop_map(|(reason_code, properties)| {
-            codec::Packet::Auth(v5::auth::Auth {
-                reason_code,
-                properties,
-            })
-        })
-}
-
-// 全種別の `codec::Packet` を生成する戦略（低水準 codec のラウンドトリップ検証用）。
-fn codec_packet_strategy() -> BoxedStrategy<codec::Packet> {
-    prop_oneof![
-        connect_strategy().boxed(),
-        connack_strategy().boxed(),
-        publish_strategy().boxed(),
-        puback_strategy().boxed(),
-        pubrec_strategy().boxed(),
-        pubrel_strategy().boxed(),
-        pubcomp_strategy().boxed(),
-        subscribe_strategy().boxed(),
-        suback_strategy().boxed(),
-        unsubscribe_strategy().boxed(),
-        unsuback_strategy().boxed(),
-        Just(codec::Packet::PingReq(v5::pingreq::PingReq)).boxed(),
-        Just(codec::Packet::PingResp(v5::pingresp::PingResp)).boxed(),
-        disconnect_strategy().boxed(),
-        auth_strategy().boxed(),
-    ]
-    .boxed()
-}
-
-// Server → Client 方向の種別のみを生成する戦略（Decoder 経由のラウンドトリップ検証用）。
-// 双方向種別（PUBLISH / PUBACK 系 / DISCONNECT / AUTH）は両方向で合法な
-// Reason Code とプロパティのみを生成するため、encode（Client → Server 検証）と
-// decode（Server → Client 検証）の両方を通る。
-fn incoming_packet_strategy() -> BoxedStrategy<codec::Packet> {
-    prop_oneof![
-        connack_strategy().boxed(),
-        publish_strategy().boxed(),
-        puback_strategy().boxed(),
-        pubrec_strategy().boxed(),
-        pubrel_strategy().boxed(),
-        pubcomp_strategy().boxed(),
-        suback_strategy().boxed(),
-        unsuback_strategy().boxed(),
-        Just(codec::Packet::PingResp(v5::pingresp::PingResp)).boxed(),
-        disconnect_strategy().boxed(),
-        auth_strategy().boxed(),
-    ]
-    .boxed()
-}
-
-// Client → Server 専用種別のみを生成する戦略（Decoder の方向拒否検証用）。
-fn outgoing_only_packet_strategy() -> BoxedStrategy<codec::Packet> {
-    prop_oneof![
-        connect_strategy().boxed(),
-        subscribe_strategy().boxed(),
-        unsubscribe_strategy().boxed(),
-        Just(codec::Packet::PingReq(v5::pingreq::PingReq)).boxed(),
-    ]
-    .boxed()
-}
-
-// Server → Client 側専用の Reason Code やプロパティを含む OutgoingPacket を
-// 生成する戦略。encode が Err(EncodeError::InvalidField { .. }) を返すことを検証する。
-fn reverse_direction_outgoing_strategy() -> BoxedStrategy<OutgoingPacket> {
-    // Success (0x00) は Server 側専用の Reason Code（MQTT v5.0 §3.15.2.1 Table 3-11）
-    let auth = auth_properties_strategy().prop_map(|properties| {
-        OutgoingPacket::Auth(v5::auth::Auth {
-            reason_code: v5::auth::AuthReasonCode::Success,
-            properties,
-        })
-    });
-    // Server 側専用の Reason Code（MQTT v5.0 §3.14.2.1 Table 3-10 の「Sent by」列）
-    let disconnect = (
-        select(&[
-            v5::disconnect::DisconnectReasonCode::ServerShuttingDown,
-            v5::disconnect::DisconnectReasonCode::SessionTakenOver,
-            v5::disconnect::DisconnectReasonCode::ServerMoved,
-        ]),
-        reason_code_properties_strategy(),
-    )
-        .prop_map(|(reason_code, properties)| {
+        }
+        1 => {
+            // Server 側専用の Reason Code（MQTT v5.0 §3.14.2.1 Table 3-10 の「Sent by」列）
+            let reason_code = noprop::sample_choice(
+                ctx,
+                &[
+                    v5::disconnect::DisconnectReasonCode::ServerShuttingDown,
+                    v5::disconnect::DisconnectReasonCode::SessionTakenOver,
+                    v5::disconnect::DisconnectReasonCode::ServerMoved,
+                ],
+            );
+            let properties = sample_reason_code_properties(ctx);
             OutgoingPacket::Disconnect(v5::disconnect::Disconnect {
                 reason_code,
                 properties,
             })
-        });
-    // Subscription Identifier (0x0B) は Client → Server 方向の PUBLISH では許可されない
-    // （MQTT v5.0 §3.3.4 [MQTT-3.3.4-6]）
-    let publish = (
-        string_strategy(),
-        qos_strategy(),
-        any::<u16>(),
-        binary_strategy(),
-        (1u32..=VariableByteInteger::MAX).prop_map(VariableByteInteger),
-    )
-        .prop_filter(
-            "PUBLISH のトピック名は空にできない",
-            |(topic, ..)| !topic.is_empty(),
-        )
-        .prop_filter(
-            "有効な PUBLISH パケット識別子",
-            |(_, qos, packet_id, ..)| *qos == QoS::AtMostOnce || *packet_id != 0,
-        )
-        .prop_map(|(topic, qos, packet_id, payload, subscription_id)| {
-            let id = if qos == QoS::AtMostOnce {
-                None
+        }
+        2 => {
+            // Subscription Identifier (0x0B) は Client → Server 方向の PUBLISH では許可されない
+            // （MQTT v5.0 §3.3.4 [MQTT-3.3.4-6]）
+            let topic = helpers::sample_string_in(ctx, 1, 100);
+            let qos = helpers::sample_qos(ctx);
+            // QoS 0 のときは packet_id なし（valid-by-construction）。
+            let packet_id = if qos == QoS::AtMostOnce {
+                0
             } else {
-                Some(packet_id)
+                noprop::sample_usize_in(ctx, 1..=u16::MAX as usize) as u16
             };
+            let payload = helpers::sample_binary(ctx);
+            let subscription_id = VariableByteInteger(sample_vbi_value(ctx));
             let mut properties = Properties::new();
             properties.push(Property::SubscriptionIdentifier(subscription_id));
             OutgoingPacket::Publish(v5::publish::Publish {
@@ -893,89 +773,128 @@ fn reverse_direction_outgoing_strategy() -> BoxedStrategy<OutgoingPacket> {
                 qos,
                 retain: false,
                 topic,
-                packet_id: id,
+                packet_id: (packet_id != 0).then_some(packet_id),
                 properties,
                 payload,
             })
-        });
-    // 0x10 No matching subscribers は Server 側専用（MQTT v5.0 §3.4.2.1 / MQTT v5.0 §3.5.2.1）
-    let puback =
-        (1..=u16::MAX, reason_code_properties_strategy()).prop_map(|(packet_id, properties)| {
+        }
+        3 => {
+            // 0x10 No matching subscribers は Server 側専用（MQTT v5.0 §3.4.2.1）
+            let packet_id = sample_nonzero_u16(ctx);
+            let properties = sample_reason_code_properties(ctx);
             OutgoingPacket::PubAck(v5::puback::PubAck {
                 packet_id,
                 reason_code: v5::puback::PubAckReasonCode::NoMatchingSubscribers,
                 properties,
             })
-        });
-    let pubrec =
-        (1..=u16::MAX, reason_code_properties_strategy()).prop_map(|(packet_id, properties)| {
+        }
+        _ => {
+            // 0x10 No matching subscribers は Server 側専用（MQTT v5.0 §3.5.2.1）
+            let packet_id = sample_nonzero_u16(ctx);
+            let properties = sample_reason_code_properties(ctx);
             OutgoingPacket::PubRec(v5::pubrec::PubRec {
                 packet_id,
                 reason_code: v5::pubrec::PubRecReasonCode::NoMatchingSubscribers,
                 properties,
             })
-        });
-    prop_oneof![
-        auth.boxed(),
-        disconnect.boxed(),
-        publish.boxed(),
-        puback.boxed(),
-        pubrec.boxed(),
-    ]
-    .boxed()
+        }
+    }
 }
 
-proptest! {
-    #[test]
-    fn property_roundtrip(property in property_strategy()) {
+#[test]
+fn property_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let property = sample_random_property(ctx);
         let mut buf = vec![0u8; 65536];
         let len = property.encode(&mut buf).expect("エンコードに成功すること");
         let (decoded, consumed) = Property::decode(&buf[..len]).expect("デコードに成功すること");
-        prop_assert_eq!(decoded, property);
-        prop_assert_eq!(consumed, len);
-    }
+        assert_eq!(decoded, property);
+        assert_eq!(consumed, len);
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn packet_roundtrip(packet in codec_packet_strategy()) {
+#[test]
+fn packet_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_codec_packet(ctx);
         let mut buf = vec![0u8; 65536];
         let len = packet.encode(&mut buf).expect("エンコードに成功すること");
-        let (decoded, consumed) = codec::Packet::decode(&buf[..len]).expect("デコードに成功すること");
-        prop_assert_eq!(decoded.clone(), packet);
-        prop_assert_eq!(consumed, len);
+        let (decoded, consumed) =
+            codec::Packet::decode(&buf[..len]).expect("デコードに成功すること");
+        assert_eq!(decoded.clone(), packet);
+        assert_eq!(consumed, len);
 
         let mut buf2 = vec![0u8; 65536];
-        let len2 = decoded.encode(&mut buf2).expect("再エンコードに成功すること");
-        prop_assert_eq!(&buf[..len], &buf2[..len2]);
-    }
+        let len2 = decoded
+            .encode(&mut buf2)
+            .expect("再エンコードに成功すること");
+        assert_eq!(&buf[..len], &buf2[..len2]);
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn packet_encode_exact_buffer(packet in codec_packet_strategy()) {
+#[test]
+fn packet_encode_exact_buffer() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_codec_packet(ctx);
         // 合計長ちょうどのバッファで encode() が Ok(合計長) を返すことを検証する。
         // 戻り値の一致まで検証し、encoded_len() の過大見積もりも検出する。
         // 過小見積もりの場合はバッファ書き込み時の panic または
         // 内部エンコーダからの予期しない Err(BufferTooSmall) として検出される。
-        let encoded = packet.encode_to_vec().expect("エンコード可能なパケットであること");
+        let encoded = packet
+            .encode_to_vec()
+            .expect("エンコード可能なパケットであること");
         let total_len = encoded.len();
         let mut buf = vec![0u8; total_len];
         let len = packet
             .encode(&mut buf)
             .expect("合計長ちょうどのバッファでエンコードに成功すること");
-        prop_assert_eq!(len, total_len);
-        prop_assert_eq!(&buf[..len], &encoded[..]);
-    }
+        assert_eq!(len, total_len);
+        assert_eq!(&buf[..len], &encoded[..]);
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn packet_encode_short_buffer_fails(packet in codec_packet_strategy()) {
+#[test]
+fn packet_encode_short_buffer_fails() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_codec_packet(ctx);
         // 合計長 - 1 のバッファで encode() が Err(BufferTooSmall) を返すことを検証する。
-        let encoded = packet.encode_to_vec().expect("エンコード可能なパケットであること");
+        let encoded = packet
+            .encode_to_vec()
+            .expect("エンコード可能なパケットであること");
         let total_len = encoded.len();
         let mut buf = vec![0u8; total_len - 1];
         let result = packet.encode(&mut buf);
-        prop_assert_eq!(result, Err(EncodeError::BufferTooSmall));
-    }
+        assert_eq!(result, Err(EncodeError::BufferTooSmall));
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn incoming_roundtrip(packet in incoming_packet_strategy()) {
+#[test]
+fn incoming_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_incoming_packet(ctx);
         // Server → Client 方向のパケットを低水準 codec でエンコードし、
         // Decoder 経由で IncomingPacket としてデコードして内部 struct が一致することを検証する。
         let encoded = packet.encode_to_vec().expect("エンコードに成功すること");
@@ -990,86 +909,92 @@ proptest! {
                 VersionedIncomingPacket::V5(IncomingPacket::ConnAck(decoded)),
                 codec::Packet::ConnAck(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::Publish(decoded)),
                 codec::Packet::Publish(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::PubAck(decoded)),
                 codec::Packet::PubAck(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::PubRec(decoded)),
                 codec::Packet::PubRec(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::PubRel(decoded)),
                 codec::Packet::PubRel(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::PubComp(decoded)),
                 codec::Packet::PubComp(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::SubAck(decoded)),
                 codec::Packet::SubAck(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::UnsubAck(decoded)),
                 codec::Packet::UnsubAck(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::PingResp(decoded)),
                 codec::Packet::PingResp(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::Disconnect(decoded)),
                 codec::Packet::Disconnect(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
             (
                 VersionedIncomingPacket::V5(IncomingPacket::Auth(decoded)),
                 codec::Packet::Auth(packet),
             ) => {
-                prop_assert_eq!(&decoded, packet);
+                assert_eq!(&decoded, packet);
             }
-            _ => prop_assert!(false, "デコード結果の種別が元のパケットと一致しない"),
+            _ => panic!("デコード結果の種別が元のパケットと一致しない"),
         }
-    }
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn decoder_rejects_reverse_direction(
-        outgoing in outgoing_only_packet_strategy(),
-        incoming in incoming_packet_strategy(),
-    ) {
+#[test]
+fn decoder_rejects_reverse_direction() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let outgoing = sample_outgoing_only_packet(ctx);
+        let incoming = sample_incoming_packet(ctx);
         // Client → Server 専用種別を feed すると Decoder は UnexpectedPacket で拒否する。
         let encoded = outgoing.encode_to_vec().expect("エンコードに成功すること");
         let mut decoder = Decoder::new_v5(Limits::new());
         decoder.feed(&encoded).expect("feed に成功すること");
         match decoder.decode() {
             Err(DecodeError::UnexpectedPacket { packet_type }) => {
-                prop_assert_eq!(packet_type, encoded[0] & 0xF0);
+                assert_eq!(packet_type, encoded[0] & 0xF0);
             }
-            _ => prop_assert!(false, "UnexpectedPacket エラーが返ること"),
+            _ => panic!("UnexpectedPacket エラーが返ること"),
         }
         // 1 フレーム消費・後続維持: 拒否後に正しい方向のパケットを続けてデコードできる。
         let incoming_encoded = incoming.encode_to_vec().expect("エンコードに成功すること");
@@ -1077,69 +1002,73 @@ proptest! {
             .feed(&incoming_encoded)
             .expect("feed に成功すること");
         let decoded = decoder.decode().expect("デコードに成功すること");
-        prop_assert!(matches!(decoded, Some(VersionedIncomingPacket::V5(_))));
-    }
+        assert!(matches!(decoded, Some(VersionedIncomingPacket::V5(_))));
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn outgoing_encode_rejects_reverse_direction(
-        packet in reverse_direction_outgoing_strategy(),
-    ) {
+#[test]
+fn outgoing_encode_rejects_reverse_direction() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_reverse_direction_outgoing(ctx);
         // Server → Client 側専用の Reason Code やプロパティを含む OutgoingPacket の
         // エンコードは Err(EncodeError::InvalidField { .. }) で拒否される。
         // 拒否原因は複数あり得るため、原因を問わず検証エラーであることのみを見る。
-        // `matches!` の波括弧が prop_assert! 内部の concat! と衝突するため、
-        // 判定結果を変数に取り出してから渡す。
-        let is_invalid_field = matches!(packet.encode_to_vec(), Err(EncodeError::InvalidField { .. }));
-        prop_assert!(is_invalid_field);
-    }
+        let is_invalid_field = matches!(
+            packet.encode_to_vec(),
+            Err(EncodeError::InvalidField { .. })
+        );
+        assert!(is_invalid_field);
+        Ok(())
+    })?;
+    Ok(())
 }
 
-proptest! {
-    // Just 固定入力のため、デフォルト 256 ケースで同一内容が繰り返されるのを防ぐ。
-    #![proptest_config(ProptestConfig::with_cases(1))]
+/// 残り長さの符号化長が変化する境界（127・128・16,383・16,384）を
+/// 1 テスト内で確定的に生成して検証する。
+///
+/// MQTT v5.0 §1.5.5 [MQTT-1.5.5-1]:
+/// 残り長さは最小バイト数でエンコードする必要がある。
+/// VBI の符号化長そのものの検証は codec 層の単体テストに委ね、
+/// パケットレベルでは encoded_len() の一致と戻り値の一致で間接的に検出する。
+///
+/// PUBLISH QoS 0・トピック "t"（1 バイト）・空プロパティをベースにする。
+/// QoS 0 の PUBLISH は dup: true や packet_id: Some(_) だと
+/// validate() が Err(InvalidField) を返すため、dup: false・packet_id: None で構築する。
+/// プロパティを空に固定してもプロパティ長 VBI の 1 バイトが入るため、
+/// v5.0 の固定オーバーヘッド: 2（トピック長）+ 1（トピック "t"）+ 1（プロパティ長 VBI）。
+#[test]
+fn remaining_length_boundary() {
+    let overhead = 2 + 1 + 1;
+    for &target in helpers::REMAINING_LENGTH_BOUNDARIES {
+        let payload_len = helpers::payload_len_for_remaining_length(target, overhead);
+        let packet = codec::Packet::Publish(v5::publish::Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "t".to_string(),
+            packet_id: None,
+            properties: Properties::new(),
+            payload: vec![0u8; payload_len],
+        });
+        assert_eq!(packet.encoded_len(), target);
 
-    #[test]
-    fn remaining_length_boundary(_input in Just(())) {
-        // 残り長さの符号化長が変化する境界（127・128・16,383・16,384）を
-        // 1 ケース内で確定的に生成して検証する。
-        //
-        // MQTT v5.0 §1.5.5 [MQTT-1.5.5-1]:
-        // 残り長さは最小バイト数でエンコードする必要がある。
-        // VBI の符号化長そのものの検証は codec 層の単体テストに委ね、
-        // パケットレベルでは encoded_len() の一致と戻り値の一致で間接的に検出する。
-        //
-        // PUBLISH QoS 0・トピック "t"（1 バイト）・空プロパティをベースにする。
-        // QoS 0 の PUBLISH は dup: true や packet_id: Some(_) だと
-        // validate() が Err(InvalidField) を返すため、dup: false・packet_id: None で構築する。
-        // プロパティを空に固定してもプロパティ長 VBI の 1 バイトが入るため、
-        // v5.0 の固定オーバーヘッド: 2（トピック長）+ 1（トピック "t"）+ 1（プロパティ長 VBI）。
-        let overhead = 2 + 1 + 1;
-        for &target in helpers::REMAINING_LENGTH_BOUNDARIES {
-            let payload_len = helpers::payload_len_for_remaining_length(target, overhead);
-            let packet = codec::Packet::Publish(v5::publish::Publish {
-                dup: false,
-                qos: QoS::AtMostOnce,
-                retain: false,
-                topic: "t".to_string(),
-                packet_id: None,
-                properties: Properties::new(),
-                payload: vec![0u8; payload_len],
-            });
-            prop_assert_eq!(packet.encoded_len(), target);
+        let encoded = packet.encode_to_vec().expect("エンコードに成功すること");
+        let total_len = encoded.len();
 
-            let encoded = packet.encode_to_vec().expect("エンコードに成功すること");
-            let total_len = encoded.len();
+        let mut buf = vec![0u8; total_len];
+        let len = packet
+            .encode(&mut buf)
+            .expect("合計長ちょうどでエンコードに成功すること");
+        assert_eq!(len, total_len);
 
-            let mut buf = vec![0u8; total_len];
-            let len = packet
-                .encode(&mut buf)
-                .expect("合計長ちょうどでエンコードに成功すること");
-            prop_assert_eq!(len, total_len);
-
-            let mut short_buf = vec![0u8; total_len - 1];
-            let result = packet.encode(&mut short_buf);
-            prop_assert_eq!(result, Err(EncodeError::BufferTooSmall));
-        }
+        let mut short_buf = vec![0u8; total_len - 1];
+        let result = packet.encode(&mut short_buf);
+        assert_eq!(result, Err(EncodeError::BufferTooSmall));
     }
 }
 
@@ -1249,29 +1178,33 @@ fn packet_properties_mut(packet: &mut codec::Packet) -> Option<&mut Properties> 
 }
 
 /// 有効なパケットと、そのパケットでは許可されないプロパティの組を生成する。
-fn packet_and_disallowed_property_strategy() -> impl Strategy<Value = (codec::Packet, Property)> {
-    codec_packet_strategy()
-        .prop_filter(
-            "プロパティを持つパケットのみを対象にする",
-            |packet| encode_allowed_identifiers(packet).is_some(),
-        )
-        .prop_flat_map(|packet| {
-            let allowed =
-                encode_allowed_identifiers(&packet).expect("プロパティを持つパケットであること");
-            let disallowed: Vec<u8> = ALL_PROPERTY_IDENTIFIERS
-                .iter()
-                .copied()
-                .filter(|identifier| !allowed.contains(identifier))
-                .collect();
-            (Just(packet), select(disallowed).prop_map(sample_property))
-        })
+fn sample_packet_and_disallowed_property(ctx: &mut TestCaseContext) -> (codec::Packet, Property) {
+    // プロパティを持つパケットのみを対象にする。codec_packet の 15 種のうち
+    // PingReq / PingResp の 2 種はプロパティを持たないため、受容率は 13/15。
+    // max_attempts=8 で枯渇する確率は (2/15)^8 ≈ 4e-7 と実質ゼロである。
+    let packet = noprop::sample_with_rejection(ctx, 8, |ctx| {
+        let packet = sample_codec_packet(ctx);
+        encode_allowed_identifiers(&packet)
+            .is_some()
+            .then_some(packet)
+    });
+    let allowed = encode_allowed_identifiers(&packet).expect("プロパティを持つパケットであること");
+    let disallowed: Vec<u8> = ALL_PROPERTY_IDENTIFIERS
+        .iter()
+        .copied()
+        .filter(|identifier| !allowed.contains(identifier))
+        .collect();
+    let identifier = noprop::sample_choice(ctx, &disallowed);
+    (packet, sample_property(identifier))
 }
 
-proptest! {
-    #[test]
-    fn packet_with_disallowed_property_is_rejected_on_encode(
-        (mut packet, property) in packet_and_disallowed_property_strategy()
-    ) {
+#[test]
+fn packet_with_disallowed_property_is_rejected_on_encode() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let (mut packet, property) = sample_packet_and_disallowed_property(ctx);
         // MQTT v5.0 §2.2.2.2 Table 2-4:
         // プロパティはパケット種別ごとに使用できるものが定められている。
         // 許可されない識別子を 1 つ挿入した有効パケットは、
@@ -1280,53 +1213,65 @@ proptest! {
             .expect("プロパティを持つパケットであること")
             .push(property);
         let mut buf = vec![0u8; 65536];
-        prop_assert_eq!(
+        assert_eq!(
             packet.encode(&mut buf),
             Err(EncodeError::InvalidField {
                 reason: EncodeInvalidField::PropertyValidationFailed,
             })
         );
-    }
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn connect_will_with_disallowed_property_is_rejected_on_encode(
-        packet in connect_strategy(),
-        will in will_strategy(),
-        identifier in select(
-            ALL_PROPERTY_IDENTIFIERS
-                .iter()
-                .copied()
-                .filter(|identifier| !WILL_ALLOWED_IDENTIFIERS.contains(identifier))
-                .collect::<Vec<u8>>()
-        )
-    ) {
+#[test]
+fn connect_will_with_disallowed_property_is_rejected_on_encode() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_connect(ctx);
+        let mut will = sample_will(ctx);
+        // Will プロパティで許可されない識別子を 1 つ選ぶ。
+        let disallowed: Vec<u8> = ALL_PROPERTY_IDENTIFIERS
+            .iter()
+            .copied()
+            .filter(|identifier| !WILL_ALLOWED_IDENTIFIERS.contains(identifier))
+            .collect();
+        let identifier = noprop::sample_choice(ctx, &disallowed);
+        will.properties.push(sample_property(identifier));
+
         // MQTT v5.0 §3.1.3.2:
         // Will プロパティにも許可リストがあり、許可されない識別子を
         // 挿入した Will 付き CONNECT はエンコード時に拒否される。
         let codec::Packet::Connect(mut connect) = packet else {
-            unreachable!("connect_strategy は CONNECT パケットのみを生成する");
+            unreachable!("sample_connect は CONNECT パケットのみを生成する");
         };
-        let mut will = will;
-        will.properties.push(sample_property(identifier));
         connect.will = Some(will);
         let mut buf = vec![0u8; 65536];
-        prop_assert_eq!(
+        assert_eq!(
             codec::Packet::Connect(connect).encode(&mut buf),
             Err(EncodeError::InvalidField {
                 reason: EncodeInvalidField::PropertyValidationFailed,
             })
         );
-    }
+        Ok(())
+    })?;
+    Ok(())
+}
 
-    #[test]
-    fn connect_authentication_data_without_method_is_rejected_on_encode(
-        packet in connect_strategy()
-    ) {
+#[test]
+fn connect_authentication_data_without_method_is_rejected_on_encode() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(256, |ctx| {
+        let packet = sample_connect(ctx);
         // MQTT v5.0 §3.1.2.11.10:
         // Authentication Method なしで Authentication Data を含む CONNECT は
         // Protocol Error であり、エンコード時に拒否される。
         let codec::Packet::Connect(mut connect) = packet else {
-            unreachable!("connect_strategy は CONNECT パケットのみを生成する");
+            unreachable!("sample_connect は CONNECT パケットのみを生成する");
         };
         let mut properties = Properties::new();
         for property in connect.properties.iter() {
@@ -1337,11 +1282,13 @@ proptest! {
         properties.push(Property::AuthenticationData(vec![0x01]));
         connect.properties = properties;
         let mut buf = vec![0u8; 65536];
-        prop_assert_eq!(
+        assert_eq!(
             codec::Packet::Connect(connect).encode(&mut buf),
             Err(EncodeError::InvalidField {
                 reason: EncodeInvalidField::PropertyValidationFailed,
             })
         );
-    }
+        Ok(())
+    })?;
+    Ok(())
 }

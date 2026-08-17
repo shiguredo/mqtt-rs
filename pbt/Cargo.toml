@@ -7,7 +7,9 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-# プロパティベーステスト (PBT) の実行用
-proptest = "1.11"
 # テスト対象の本体クレート
 shiguredo_mqtt = { path = ".." }
+
+[dev-dependencies]
+# プロパティベーステスト (PBT) の実行用
+noprop = "0.2.0"
