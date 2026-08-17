@@ -81,6 +81,13 @@ fn auth_initial_success_transition() -> noprop::TestResult {
         assert!(session.auth_state().is_authenticated());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -102,6 +109,13 @@ fn auth_initial_continue_then_connack_success() -> noprop::TestResult {
         assert!(session.auth_state().is_authenticated());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -119,6 +133,13 @@ fn auth_initial_unknown_reason_code_fails() -> noprop::TestResult {
         assert_eq!(session.auth_state().state(), AuthState::Idle);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -156,6 +177,13 @@ fn reauthenticate_sequence() -> noprop::TestResult {
         assert!(session.auth_state().is_authenticated());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -176,6 +204,13 @@ fn auth_reset_returns_to_idle() -> noprop::TestResult {
         assert_eq!(session.auth_state().auth_method(), None);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -219,6 +254,13 @@ fn initial_authentication_never_completes_via_auth_packet() -> noprop::TestResul
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -245,5 +287,12 @@ fn initial_authentication_method_mismatch_is_reported() -> noprop::TestResult {
         assert_eq!(session.auth_state().state(), AuthState::Idle);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }

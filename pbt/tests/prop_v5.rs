@@ -815,6 +815,13 @@ fn property_roundtrip() -> noprop::TestResult {
         assert_eq!(consumed, len);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -839,6 +846,13 @@ fn packet_roundtrip() -> noprop::TestResult {
         assert_eq!(&buf[..len], &buf2[..len2]);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -865,6 +879,13 @@ fn packet_encode_exact_buffer() -> noprop::TestResult {
         assert_eq!(&buf[..len], &encoded[..]);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -885,6 +906,13 @@ fn packet_encode_short_buffer_fails() -> noprop::TestResult {
         assert_eq!(result, Err(EncodeError::BufferTooSmall));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -975,6 +1003,13 @@ fn incoming_roundtrip() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1005,6 +1040,13 @@ fn decoder_rejects_reverse_direction() -> noprop::TestResult {
         assert!(matches!(decoded, Some(VersionedIncomingPacket::V5(_))));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1025,6 +1067,13 @@ fn outgoing_encode_rejects_reverse_direction() -> noprop::TestResult {
         assert!(is_invalid_field);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1221,6 +1270,13 @@ fn packet_with_disallowed_property_is_rejected_on_encode() -> noprop::TestResult
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1257,6 +1313,13 @@ fn connect_will_with_disallowed_property_is_rejected_on_encode() -> noprop::Test
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1290,5 +1353,12 @@ fn connect_authentication_data_without_method_is_rejected_on_encode() -> noprop:
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }

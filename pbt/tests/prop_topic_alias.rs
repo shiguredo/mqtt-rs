@@ -61,6 +61,13 @@ fn alias_resolve_consistency() -> noprop::TestResult {
         assert_eq!(from_alias, topic_name);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -97,6 +104,13 @@ fn receive_alias_overwrite_keeps_latest_mapping() -> noprop::TestResult {
         assert_eq!(resolved, second);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -132,6 +146,13 @@ fn receive_mapping_matches_model() -> noprop::TestResult {
         assert_eq!(manager.alias_count(), model.len());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -152,6 +173,13 @@ fn alias_exceeding_maximum_returns_none() -> noprop::TestResult {
         assert!(manager.resolve_on_receive(&topic, alias).is_none());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -160,6 +188,7 @@ fn alias_exceeding_maximum_returns_none() -> noprop::TestResult {
 #[test]
 fn send_alias_register_find_and_reuse() -> noprop::TestResult {
     let seed = noprop::seed_from_env_or_time("MQTT_PBT_SEED")?;
+    let bucket_full = std::cell::Cell::new(0usize);
     let mut runner = noprop::Runner::new(seed);
 
     runner.run(256, |ctx| {
@@ -192,6 +221,7 @@ fn send_alias_register_find_and_reuse() -> noprop::TestResult {
                         Some(*known_alias)
                     );
                 }
+                bucket_full.set(bucket_full.get() + 1);
                 continue;
             }
 
@@ -205,6 +235,23 @@ fn send_alias_register_find_and_reuse() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // 枠が埋まった状態の分岐が一度も生成されないと空振りになるため、
+    // ゲートで到達を保証する。
+    // p 推定値: max ~ U(1..=16)・トピック数 ~ U(1..=8)（ほぼ全て互いに異なる）で
+    // P(枠埋まり) = P(max <= トピック数) ≈ 4.5 / 16 ≈ 0.28。
+    // 256 ケースでの miss 確率は 0.72^256 ≈ 0。
+    assert!(
+        bucket_full.get() > 0,
+        "エイリアス枠が埋まった状態の分岐が一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -222,6 +269,13 @@ fn no_send_alias_when_peer_max_zero() -> noprop::TestResult {
         assert_eq!(manager.find_alias_for_topic(&topic_name), None);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -245,6 +299,13 @@ fn received_alias_is_not_reused_for_send() -> noprop::TestResult {
         assert_eq!(manager.find_alias_for_topic(&topic), None);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -291,5 +352,12 @@ fn reset_variants_clear_expected_state() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }

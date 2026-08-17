@@ -105,6 +105,13 @@ fn session_proptest_connect_disconnect_lifecycle() -> noprop::TestResult {
         assert_eq!(session.clean_start(), clean_start);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -136,6 +143,13 @@ fn session_proptest_pingresp_received_clears_awaiting_state() -> noprop::TestRes
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -187,6 +201,13 @@ fn session_proptest_auth_received_delegation() -> noprop::TestResult {
         assert!(session.auth_state().is_authenticated());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -207,6 +228,13 @@ fn session_proptest_pending_retransmissions_qos1() -> noprop::TestResult {
         assert_eq!(retrans[0].0, packet_id);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -232,6 +260,13 @@ fn session_proptest_pending_retransmissions_empty_after_puback() -> noprop::Test
         assert!(retrans.is_empty());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -276,6 +311,13 @@ fn session_proptest_resend_pubrel_does_not_consume_send_quota() -> noprop::TestR
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -313,6 +355,13 @@ fn session_proptest_qos2_incoming_quota_released_at_pubcomp() -> noprop::TestRes
         assert!(session.flow_control().can_receive());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -354,6 +403,13 @@ fn session_proptest_configure_for_connect() -> noprop::TestResult {
         }
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -406,6 +462,13 @@ fn session_proptest_apply_connack() -> noprop::TestResult {
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -469,6 +532,13 @@ fn session_proptest_apply_connack_rejects_invalid_connection_state() -> noprop::
         assert_eq!(session.connection_state(), before);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -506,6 +576,13 @@ fn session_proptest_apply_connack_rejects_v311_return_code_for_v5_session() -> n
         assert!(!session.is_connected());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -543,6 +620,13 @@ fn session_proptest_apply_connack_rejects_v5_reason_code_for_v311_session() -> n
         assert!(!session.is_connected());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -612,6 +696,13 @@ fn session_proptest_apply_connack_rejects_v5_only_params_for_v311_session() -> n
         assert_eq!(session.connection_state(), ConnectionState::Connecting);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -706,6 +797,13 @@ fn session_proptest_connect_sent_with_auth_rejects_v311_session() -> noprop::Tes
         assert_eq!(session.server_capabilities(), &before_server_capabilities);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -754,6 +852,13 @@ fn session_proptest_apply_connack_accepts_v311_with_none_v5_fields() -> noprop::
         assert!(session.is_connected());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -796,6 +901,13 @@ fn session_proptest_publish_sent_then_handle_puback_returns_to_zero() -> noprop:
         assert_eq!(session.packet_id_manager().in_use_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -826,6 +938,13 @@ fn session_proptest_publish_sent_then_abort_publish_recovers_all() -> noprop::Te
         assert_eq!(session.packet_id_manager().in_use_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -876,6 +995,13 @@ fn session_proptest_publish_sent_err_then_release_packet_id_matches_contract() -
         assert_eq!(session.flow_control().outstanding_count(), receive_maximum);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -910,6 +1036,13 @@ fn session_proptest_subscribe_sent_then_handle_suback_ok_activates() -> noprop::
         assert_eq!(session.packet_id_manager().in_use_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -943,6 +1076,13 @@ fn session_proptest_subscribe_sent_then_abort_subscribe_drops_pending() -> nopro
         assert_eq!(session.subscription_manager().active_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -997,6 +1137,13 @@ fn session_proptest_subscribe_sent_then_handle_suback_v5_mismatch_is_err() -> no
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1046,6 +1193,13 @@ fn session_proptest_unsubscribe_sent_then_handle_unsuback_v5_mismatch_is_err() -
         );
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1087,6 +1241,13 @@ fn session_proptest_unsubscribe_sent_then_handle_unsuback_v5_ok_removes_active()
         assert_eq!(session.packet_id_manager().in_use_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -1125,5 +1286,12 @@ fn session_proptest_unsubscribe_sent_then_handle_unsuback_v311_empty_ok() -> nop
         assert_eq!(session.packet_id_manager().in_use_count(), 0);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }

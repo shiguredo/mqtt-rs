@@ -14,6 +14,13 @@ fn keep_alive_zero_never_requires_pingreq() -> noprop::TestResult {
         assert!(!ka.should_send_pingreq(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -32,6 +39,13 @@ fn keep_alive_zero_never_times_out_even_when_awaiting_pingresp() -> noprop::Test
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -66,9 +80,19 @@ fn should_send_pingreq_respects_interval_since_activity() -> noprop::TestResult 
 
     // offset >= interval のケースが一度も生成されないと PINGREQ 必要側の
     // 分岐が空振りになるため、ゲートで到達を保証する。
+    // p 推定値: interval = keep_alive * 1000 ~ U(1000..=3,600,000)・offset ~ U(0..=1,000,000)。
+    // P(offset >= interval) ≈ 0.28 (interval <= 1e6 の確率) × 0.5 ≈ 0.14。
+    // 256 ケースでの miss 確率は 0.86^256 ≈ 3e-17。
     assert!(
         pingreq_needed.get() > 0,
         "PINGREQ が必要になる分岐が一度も検証されなかった\n{runner}"
+    );
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
     );
     Ok(())
 }
@@ -87,6 +111,13 @@ fn no_pingreq_immediately_after_activity() -> noprop::TestResult {
         assert!(!ka.should_send_pingreq(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -103,6 +134,13 @@ fn no_timeout_when_pingreq_never_sent() -> noprop::TestResult {
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -121,6 +159,13 @@ fn timeout_after_keep_alive_since_pingreq() -> noprop::TestResult {
         assert!(ka.has_timed_out(deadline_ms.saturating_add(offset)));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -142,6 +187,13 @@ fn no_timeout_before_keep_alive_since_pingreq() -> noprop::TestResult {
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -162,6 +214,13 @@ fn no_timeout_after_pingresp_received() -> noprop::TestResult {
         assert!(!ka.is_awaiting_pingresp());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -185,6 +244,13 @@ fn pingreq_sent_uses_latest_send_time() -> noprop::TestResult {
         assert!(ka.is_awaiting_pingresp());
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -207,6 +273,13 @@ fn shortened_keep_alive_updates_timeout_deadline() -> noprop::TestResult {
         assert!(ka.has_timed_out(new_deadline));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -228,6 +301,13 @@ fn no_timeout_when_clock_regresses() -> noprop::TestResult {
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -247,6 +327,13 @@ fn no_timeout_after_set_keep_alive_zero() -> noprop::TestResult {
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -269,6 +356,13 @@ fn reset_clears_all_state() -> noprop::TestResult {
         assert!(!ka.has_timed_out(now));
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
 
@@ -287,5 +381,12 @@ fn pingresp_received_is_idempotent_when_not_awaiting() -> noprop::TestResult {
         assert_eq!(ka.keep_alive_secs(), keep_alive);
         Ok(())
     })?;
+
+    // ジェネレータは valid-by-construction であり、ケース棄却が発生しないことの検証。
+    assert_eq!(
+        runner.stats().rejected_cases,
+        0,
+        "ジェネレータが valid-by-construction であること\n{runner}"
+    );
     Ok(())
 }
